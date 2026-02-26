@@ -3,6 +3,7 @@ package io.github.elmehdaouiahmed.flutter_mrz_scanner_enhanced
 import kotlinx.coroutines.*
 import android.content.Context
 import android.graphics.*
+import androidx.exifinterface.media.ExifInterface
 import androidx.annotation.NonNull
 import androidx.core.content.ContextCompat
 import com.googlecode.tesseract.android.TessBaseAPI
@@ -10,20 +11,18 @@ import io.flutter.plugin.common.MethodChannel
 import io.fotoapparat.Fotoapparat
 import io.fotoapparat.configuration.CameraConfiguration
 import io.fotoapparat.configuration.UpdateConfiguration
-import io.fotoapparat.parameter.Resolution
 import io.fotoapparat.preview.Frame
 import io.fotoapparat.selector.off
 import io.fotoapparat.selector.torch
 import io.fotoapparat.view.CameraView
 import java.io.ByteArrayOutputStream
+import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.IOException
 import io.fotoapparat.selector.*
 import io.fotoapparat.parameter.*
 import io.fotoapparat.selector.manualJpegQuality
-import android.os.Environment
 import android.util.Log
-import android.util.Base64
 
 class FotoapparatCamera constructor(
     val context: Context,
@@ -72,45 +71,100 @@ class FotoapparatCamera constructor(
 
     fun takePhoto(@NonNull result: MethodChannel.Result, crop: Boolean) {
         val photoResult = fotoapparat.autoFocus().takePicture()
-        photoResult.toBitmap().whenAvailable { bitmapPhoto ->
-            if (bitmapPhoto != null) {
-                val bitmap = bitmapPhoto.bitmap
-                val rotated = rotateBitmap(bitmap, rotationAngle(bitmapPhoto.rotationDegrees))
-                if (crop) {
-                    // Crop the PHOTO 
-                    //val cropped = calculateCutoutRect(rotated, false) // use false if you don't want to crop to MRZ area
-                    val cropped = calculateCutoutRectCardSize(rotated, false)
-                    try {
-                        val storageDir = context.cacheDir
-                        val fileName = "cropped_image_${System.currentTimeMillis()}.jpg"
-                        val file = File(storageDir, fileName)
-                        file.outputStream().use { output ->
-                            cropped.compress(Bitmap.CompressFormat.JPEG, 100, output)
-                        }
-                        
-                        val stream = ByteArrayOutputStream()
-                        cropped.compress(Bitmap.CompressFormat.JPEG, 100, stream)
-                        val array = stream.toByteArray()
-                        mainExecutor.execute {
-                            result.success(array)
-                        }
+        photoResult.toPendingResult().whenAvailable { photo ->
+            if (photo == null) {
+                mainExecutor.execute {
+                    result.error("CAPTURE_ERROR", "Failed to capture photo", null)
+                }
+                return@whenAvailable
+            }
 
-                    } catch (e: IOException) {
-                        e.printStackTrace()
-                        mainExecutor.execute {
-                            result.error("IO_ERROR", "Failed to save cropped image", null)
-                        }
-                    }
+            try {
+                val normalizedBitmap = normalizeCapturedBitmap(photo.encodedImage, photo.rotationDegrees)
+                val outputBitmap = if (crop) {
+                    calculateCutoutRectCardSize(normalizedBitmap, false)
                 } else {
-                    val stream = ByteArrayOutputStream()
-                    rotated.compress(Bitmap.CompressFormat.JPEG, 100, stream)
-                    val array = stream.toByteArray()
-                    mainExecutor.execute {
-                        result.success(array)
-                    }
+                    normalizedBitmap
+                }
+
+                val stream = ByteArrayOutputStream()
+                outputBitmap.compress(Bitmap.CompressFormat.JPEG, 100, stream)
+                val outputBytes = stream.toByteArray()
+
+                mainExecutor.execute {
+                    result.success(outputBytes)
+                }
+            } catch (e: Exception) {
+                Log.e("FotoapparatCamera", "Failed to process captured photo: ${e.message}", e)
+                mainExecutor.execute {
+                    result.error("PHOTO_PROCESSING_ERROR", "Failed to process photo", null)
                 }
             }
         }
+    }
+
+    private fun normalizeCapturedBitmap(imageBytes: ByteArray, rotationDegrees: Int): Bitmap {
+        val decodedBitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+            ?: throw IllegalStateException("Unable to decode captured image bytes")
+
+        val exifOrientation = readExifOrientation(imageBytes)
+
+        return if (exifOrientation == ExifInterface.ORIENTATION_NORMAL ||
+            exifOrientation == ExifInterface.ORIENTATION_UNDEFINED
+        ) {
+            rotateBitmap(decodedBitmap, rotationAngle(rotationDegrees))
+        } else {
+            applyExifOrientation(decodedBitmap, exifOrientation)
+        }
+    }
+
+    private fun readExifOrientation(imageBytes: ByteArray): Int {
+        return try {
+            ByteArrayInputStream(imageBytes).use { input ->
+                val exifInterface = ExifInterface(input)
+                exifInterface.getAttributeInt(
+                    ExifInterface.TAG_ORIENTATION,
+                    ExifInterface.ORIENTATION_NORMAL
+                )
+            }
+        } catch (_: Exception) {
+            ExifInterface.ORIENTATION_UNDEFINED
+        }
+    }
+
+    private fun applyExifOrientation(source: Bitmap, orientation: Int): Bitmap {
+        val matrix = Matrix()
+        when (orientation) {
+            ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> {
+                matrix.setScale(-1f, 1f)
+            }
+            ExifInterface.ORIENTATION_ROTATE_180 -> {
+                matrix.setRotate(180f)
+            }
+            ExifInterface.ORIENTATION_FLIP_VERTICAL -> {
+                matrix.setRotate(180f)
+                matrix.postScale(-1f, 1f)
+            }
+            ExifInterface.ORIENTATION_TRANSPOSE -> {
+                matrix.setRotate(90f)
+                matrix.postScale(-1f, 1f)
+            }
+            ExifInterface.ORIENTATION_ROTATE_90 -> {
+                matrix.setRotate(90f)
+            }
+            ExifInterface.ORIENTATION_TRANSVERSE -> {
+                matrix.setRotate(-90f)
+                matrix.postScale(-1f, 1f)
+            }
+            ExifInterface.ORIENTATION_ROTATE_270 -> {
+                matrix.setRotate(-90f)
+            }
+            else -> {
+                return source
+            }
+        }
+
+        return Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix, true)
     }
     
     private fun rotationAngle(rotation: Int): Int {

@@ -1,3 +1,13 @@
+# 3.1.4
+
+- 🧭 Android photo orientation fix:
+  - `takePhoto()` now reads EXIF orientation from the captured JPEG bytes and
+    normalizes pixel orientation before returning bytes to Flutter.
+  - Falls back to Fotoapparat `rotationDegrees` only when EXIF orientation is
+    unavailable/normal.
+  - Reduces upside-down passport/document images on manufacturer-specific
+    Android camera implementations.
+
 # 3.1.3
 
 - 🛠️ Fixed: Resolved an app crash issue in version 3.1.2. Apologies for not testing on a real device prior to release.
