@@ -43,6 +43,10 @@ class FlutterMrzScannerPlugin : FlutterPlugin {
         staticChannel?.setMethodCallHandler(null)
         staticChannel = null
         appContext = null
+        // Release the cached MLKit text recognizer's native resources. MLKit
+        // recommends close()-ing recognizers when they are no longer needed;
+        // plugin detach is the natural lifetime boundary for our cache.
+        MrzOcr.shutdownMlkit()
     }
 
     private fun handleScanImage(call: MethodCall, result: MethodChannel.Result) {
