@@ -267,14 +267,20 @@ class FotoapparatCamera constructor(
         val pixels = IntArray(outW * outH)
         val black = Color.BLACK
         val white = Color.WHITE
+        // Source-pixel index math. For rotations 90/270 the output is rotated
+        // (outW=h, outH=w); the previous formulas mixed up `w` and `h`, which
+        // produced sy<0 → ArrayIndexOutOfBoundsException(index=-1) whenever
+        // the input frame was portrait (h > w). frame.rotation is interpreted
+        // here the same way as the JPEG fallback (rotateBitmap(image, -rot)),
+        // i.e. 90 means "rotate 90° CCW to upright", 270 means "rotate 90° CW".
         for (j in 0 until outH) {
             for (i in 0 until outW) {
                 val sx: Int
                 val sy: Int
                 when (rot) {
-                    90 -> { sx = j;          sy = w - 1 - i }
+                    90  -> { sx = w - 1 - j; sy = i }              // 90° CCW
                     180 -> { sx = w - 1 - i; sy = h - 1 - j }
-                    270 -> { sx = h - 1 - j; sy = i }
+                    270 -> { sx = j;         sy = h - 1 - i }      // 90° CW
                     else -> { sx = i;        sy = j }
                 }
                 val luma = y[sy * w + sx].toInt() and 0xFF
