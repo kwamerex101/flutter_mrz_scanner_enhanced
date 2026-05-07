@@ -1,10 +1,26 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_mrz_scanner_enhanced/src/camera_overlay.dart';
 import 'package:mrz_parser/mrz_parser.dart';
+
+/// Global MethodChannel used by [MRZScanner.scanImage]. Independent of any
+/// platform-view instance; registered by the plugin entrypoint on both platforms.
+const MethodChannel _staticChannel = MethodChannel('mrzscanner_static');
+
+/// Splits raw OCR text into MRZ-shaped lines, applying the same character
+/// fix-ups used by the live capture path. Top-level so both [MRZController]
+/// and [MRZScanner.scanImage] share one implementation.
+List<String> _splitRecognized(String recognizedText) {
+  final mrzString = recognizedText
+      .replaceAll(' ', '')
+      .replaceAll('«', '<')
+      .replaceAll('DZAK', 'DZA<');
+  return mrzString.split('\n').where((s) => s.isNotEmpty).toList();
+}
 
 /// MRZ scanner camera widget
 class MRZScanner extends StatelessWidget {
@@ -41,6 +57,27 @@ class MRZScanner extends StatelessWidget {
   void onPlatformViewCreated(int id) {
     final controller = MRZController._init(id);
     onControllerCreated(controller);
+  }
+
+  /// Scan a still image's bytes for an MRZ. Reuses the same Tesseract pipeline
+  /// as the live camera path via the global `mrzscanner_static` channel.
+  ///
+  /// Returns:
+  /// - a [MRZFullResult] when OCR + parse succeed,
+  /// - `null` when OCR finds nothing or the recognized text is not a valid MRZ.
+  ///
+  /// Throws [PlatformException] on native decode/scan failure.
+  static Future<MRZFullResult?> scanImage(Uint8List bytes) async {
+    final raw = await _staticChannel.invokeMethod<String>(
+      'scanImage',
+      <String, dynamic>{'bytes': bytes},
+    );
+    if (raw == null) return null;
+    final lines = _splitRecognized(raw);
+    if (lines.isEmpty) return null;
+    final parsed = MRZParser.tryParse(lines);
+    if (parsed == null) return null;
+    return MRZFullResult(mrz: raw, mrzResult: parsed);
   }
 }
 
@@ -105,14 +142,6 @@ class MRZController {
         break;
     }
     return Future.value();
-  }
-
-  List<String> _splitRecognized(String recognizedText) {
-    final mrzString = recognizedText
-        .replaceAll(' ', '')
-        .replaceAll('«', '<')
-        .replaceAll('DZAK', 'DZA<');
-    return mrzString.split('\n').where((s) => s.isNotEmpty).toList();
   }
 
   void startPreview({bool isFrontCam = false}) =>

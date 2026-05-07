@@ -28,11 +28,19 @@ class FotoapparatCamera constructor(
     val context: Context,
     var messenger: MethodChannel
 ) {
-    private val DEFAULT_PAGE_SEG_MODE = TessBaseAPI.PageSegMode.PSM_SINGLE_BLOCK
-    private var cachedTessData: File? = null
     private var mainExecutor = ContextCompat.getMainExecutor(context)
     private val job = SupervisorJob()
     private val scope = CoroutineScope(Dispatchers.IO + job)
+
+    // Per-session TessBaseAPI for the live camera frame path. Lazily inited
+    // on first OCR call, recycled in [dispose]. SEPARATE from the static
+    // path's MrzOcr.acquireSharedBaseApi(...) — see CONTEXT.md.
+    private var tessApi: TessBaseAPI? = null
+    private val tessLock = Any()
+    // Drop-while-busy throttle: while OCR is in flight on `scope`, new
+    // frames are dropped at processFrame entry — no preprocessing, no
+    // bitmap allocation, no coroutine launch.
+    private val ocrInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
 
     val cameraView = CameraView(context)
 
@@ -56,9 +64,7 @@ class FotoapparatCamera constructor(
     )
 
     init {
-        if (cachedTessData == null) {
-            cachedTessData = getFileFromAssets(context, fileName = "ocrb.traineddata")
-        }
+        MrzOcr.ensureTrainedData(context)
     }
 
     fun flashlightOn() {
@@ -178,31 +184,106 @@ class FotoapparatCamera constructor(
 
     // Process the full frame: apply pre‑processing and OCR without cropping.
     private fun processFrame(frame: Frame) {
-        val bitmap = getImage(frame)
-        //val cropped = calculateCutoutRect(bitmap, true)
-        // Preprocess the full image (convert to grayscale and apply thresholding) to improve OCR.
-        val cropped = calculateCutoutRectCardSize(bitmap, true)
-        val processedBitmap = preprocessImage(cropped)
-       
-
-
+        // Drop frames while a previous OCR is still running. Gate FIRST so
+        // that we also skip the per-pixel preprocessing cost when busy.
+        if (!ocrInFlight.compareAndSet(false, true)) return
+        val processedBitmap: Bitmap = try {
+            // Direct NV21 Y-plane → binarized + rotated bitmap. Already
+            // grayscale + thresholded — preprocessImage() is redundant on
+            // the live path now.
+            val bitmap = nv21ToBinaryBitmap(frame)
+            val cropped = calculateCutoutRectCardSize(bitmap, true)
+            // calculateCutoutRectCardSize may return the source itself if
+            // crop matches the full bitmap; only recycle when distinct.
+            if (cropped !== bitmap) {
+                try { bitmap.recycle() } catch (_: Throwable) {}
+            }
+            cropped
+        } catch (t: Throwable) {
+            ocrInFlight.set(false)
+            throw t
+        }
         scope.launch {
-        val mrzText = scanMRZ(processedBitmap)
-        val fixedMrz = extractMRZ(mrzText)
-
-        withContext(Dispatchers.Main) {
-            messenger.invokeMethod("onParsed", fixedMrz)
+            try {
+                val mrzText = scanMRZ(processedBitmap)
+                val fixedMrz = extractMRZ(mrzText)
+                withContext(Dispatchers.Main) {
+                    messenger.invokeMethod("onParsed", fixedMrz)
+                }
+            } finally {
+                // Recycle the per-frame bitmap (Tesseract.setImage copies
+                // pixels into Pix; we own the Bitmap from here).
+                try { processedBitmap.recycle() } catch (_: Throwable) {}
+                ocrInFlight.set(false)
+            }
         }
     }
-    }
 
-    private fun getImage(frame: Frame): Bitmap {
+    /**
+     * Legacy fallback: YuvImage → JPEG → Bitmap roundtrip. Retained so
+     * [nv21ToBinaryBitmap] can fall back if a device delivers an unexpected
+     * NV21 buffer size (stride/padding).
+     */
+    private fun getImageJpeg(frame: Frame): Bitmap {
         val out = ByteArrayOutputStream()
         val yuvImage = YuvImage(frame.image, ImageFormat.NV21, frame.size.width, frame.size.height, null)
         yuvImage.compressToJpeg(Rect(0, 0, frame.size.width, frame.size.height), 100, out)
         val imageBytes = out.toByteArray()
         val image = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
         return rotateBitmap(image, -frame.rotation)
+    }
+
+    /**
+     * Convert NV21 frame's Y plane directly to a binarized ARGB_8888 Bitmap
+     * (BLACK / WHITE), applying the same threshold (128) as MrzOcr.preprocess
+     * AND rotating to upright via index math. Single allocation, single
+     * pass — eliminates the YUV → JPEG → Bitmap roundtrip plus the
+     * grayscale + threshold passes.
+     *
+     * Falls back to [getImageJpeg] if the buffer is smaller than expected
+     * (defensive guard against stride/padding surprises).
+     */
+    private fun nv21ToBinaryBitmap(frame: Frame, threshold: Int = 128): Bitmap {
+        val w = frame.size.width
+        val h = frame.size.height
+        val y = frame.image
+        if (y.size < w * h) {
+            Log.w(
+                "FotoapparatCamera",
+                "Unexpected NV21 buffer size ${y.size} (expected >= ${w * h}); falling back to JPEG path"
+            )
+            return getImageJpeg(frame)
+        }
+        val rot = frame.rotation
+        val outW: Int
+        val outH: Int
+        if (rot == 90 || rot == 270) {
+            outW = h
+            outH = w
+        } else {
+            outW = w
+            outH = h
+        }
+        val pixels = IntArray(outW * outH)
+        val black = Color.BLACK
+        val white = Color.WHITE
+        for (j in 0 until outH) {
+            for (i in 0 until outW) {
+                val sx: Int
+                val sy: Int
+                when (rot) {
+                    90 -> { sx = j;          sy = w - 1 - i }
+                    180 -> { sx = w - 1 - i; sy = h - 1 - j }
+                    270 -> { sx = h - 1 - j; sy = i }
+                    else -> { sx = i;        sy = j }
+                }
+                val luma = y[sy * w + sx].toInt() and 0xFF
+                pixels[j * outW + i] = if (luma < threshold) black else white
+            }
+        }
+        val bmp = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
+        bmp.setPixels(pixels, 0, outW, 0, 0, outW, outH)
+        return bmp
     }
 
     private fun rotateBitmap(source: Bitmap, angle: Int): Bitmap {
@@ -213,40 +294,38 @@ class FotoapparatCamera constructor(
 
     // Preprocess the image by converting it to grayscale and applying a simple threshold.
     private fun preprocessImage(bitmap: Bitmap): Bitmap {
-        // Convert to grayscale.
-        val grayscale = Bitmap.createBitmap(bitmap.width, bitmap.height, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(grayscale)
-        val paint = Paint()
-        val colorMatrix = ColorMatrix().apply { setSaturation(0f) }
-        paint.colorFilter = ColorMatrixColorFilter(colorMatrix)
-        canvas.drawBitmap(bitmap, 0f, 0f, paint)
-
-        // Apply thresholding.
-        val threshold = 128
-        val width = grayscale.width
-        val height = grayscale.height
-        val pixels = IntArray(width * height)
-        grayscale.getPixels(pixels, 0, width, 0, 0, width, height)
-        for (i in pixels.indices) {
-            val gray = Color.red(pixels[i])  // For grayscale images, R=G=B.
-            pixels[i] = if (gray < threshold) Color.BLACK else Color.WHITE
-        }
-        val processed = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        processed.setPixels(pixels, 0, width, 0, 0, width, height)
-        return processed
+        return MrzOcr.preprocess(bitmap)
     }
 
+    private fun ensureTessApi(): TessBaseAPI {
+        tessApi?.let { return it }
+        synchronized(tessLock) {
+            tessApi?.let { return it }
+            MrzOcr.ensureTrainedData(context)
+            val api = TessBaseAPI()
+            api.init(context.cacheDir.absolutePath, "ocrb")
+            api.setVariable(
+                "tessedit_char_whitelist",
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<"
+            )
+            api.pageSegMode = TessBaseAPI.PageSegMode.PSM_SINGLE_BLOCK
+            tessApi = api
+            return api
+        }
+    }
+
+    // LIVE-PATH EXIF NOTE:
+    // Live frames are routed through MrzOcr.runTesseractWith, NOT
+    // MrzOcr.scanImage. Therefore MrzOcr.applyExif() is NEVER called on
+    // live frames — `frame.rotation` (handled in nv21ToBinaryBitmap) is the
+    // only orientation source the live path needs. Static-path scanImage
+    // continues to apply EXIF for image_picker / takePhoto inputs.
+    // Do not "factor out" by routing live frames through scanImage(bytes).
     // Run OCR using Tesseract on the provided bitmap.
     private fun scanMRZ(bitmap: Bitmap): String {
-        val baseApi = TessBaseAPI()
-        baseApi.init(context.cacheDir.absolutePath, "ocrb")
-        // Set Tesseract to recognize only MRZ-valid characters.
-        baseApi.setVariable("tessedit_char_whitelist", "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<")
-        baseApi.pageSegMode = DEFAULT_PAGE_SEG_MODE
-        baseApi.setImage(bitmap)
-        val mrz = baseApi.utF8Text
-        baseApi.stop()
-        return mrz
+        val api = ensureTessApi()
+        // Live frame queue is serial; no external lock needed.
+        return MrzOcr.runTesseractWith(api, bitmap) ?: ""
     }
 
     private fun extractMRZ(input: String): String {
@@ -254,19 +333,6 @@ class FotoapparatCamera constructor(
         val mrzLength = lines.last().length
         val mrzLines = lines.takeLastWhile { it.length == mrzLength }
         return mrzLines.joinToString("\n")
-    }
-
-    @Throws(IOException::class)
-    fun getFileFromAssets(context: Context, fileName: String): File {
-        val directory = File(context.cacheDir, "tessdata/")
-        directory.mkdir()
-        return File(directory, fileName).also { file ->
-            file.outputStream().use { cache ->
-                context.assets.open(fileName).use { stream -> 
-                    stream.copyTo(cache)
-                }
-            }
-        }
     }
 
 /**
@@ -364,7 +430,15 @@ class FotoapparatCamera constructor(
     }
 
     fun dispose() {
-    job.cancel()
+        job.cancel()
+        synchronized(tessLock) {
+            try { tessApi?.recycle() } catch (_: Throwable) {
+                try { tessApi?.end() } catch (_: Throwable) {
+                    try { tessApi?.stop() } catch (_: Throwable) {}
+                }
+            }
+            tessApi = null
+        }
     }
 }
 

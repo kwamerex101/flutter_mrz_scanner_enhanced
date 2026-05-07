@@ -4,6 +4,43 @@ import AVFoundation
 
 import SwiftyTesseract
 
+/// Global MethodChannel `mrzscanner_static` for the widget-less
+/// `MRZScanner.scanImage(Uint8List bytes)` Dart API.
+@objc public class MrzStaticChannel: NSObject {
+    @objc public static func register(with messenger: FlutterBinaryMessenger) {
+        let channel = FlutterMethodChannel(name: "mrzscanner_static", binaryMessenger: messenger)
+        channel.setMethodCallHandler { call, result in
+            guard call.method == "scanImage" else {
+                result(FlutterMethodNotImplemented)
+                return
+            }
+            guard let args = call.arguments as? [String: Any],
+                  let bytes = args["bytes"] as? FlutterStandardTypedData else {
+                result(FlutterError(code: "BAD_ARGS", message: "Missing bytes", details: nil))
+                return
+            }
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let text = try MrzImageOcr.shared.scanImage(data: bytes.data)
+                    DispatchQueue.main.async { result(text) }
+                } catch MrzImageOcrError.decodeFailed {
+                    DispatchQueue.main.async {
+                        result(FlutterError(code: "DECODE_FAILED",
+                                            message: "Unable to decode image bytes",
+                                            details: nil))
+                    }
+                } catch {
+                    DispatchQueue.main.async {
+                        result(FlutterError(code: "SCAN_FAILED",
+                                            message: error.localizedDescription,
+                                            details: nil))
+                    }
+                }
+            }
+        }
+    }
+}
+
 @objc public class FlutterMRZScannerFactory: NSObject, FlutterPlatformViewFactory {
     
     let controller: FlutterBinaryMessenger

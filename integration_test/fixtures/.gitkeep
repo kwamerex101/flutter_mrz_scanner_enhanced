@@ -1,0 +1,3 @@
+Synthetic sample_mrz.png is generated lazily on first bench run (see
+scan_image_bench_test.dart). Operators may also drop a real passport sample
+at `sample_mrz.png` here for higher-fidelity OCR latency measurements.

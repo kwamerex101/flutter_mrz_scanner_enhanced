@@ -11,15 +11,27 @@ public protocol MRZScannerViewDelegate: AnyObject {
 }
 
 public class MRZScannerView: UIView {
-    // EDIT: Initialized Tesseract with the ocrb language.
-    fileprivate let tesseract = SwiftyTesseract(language: .custom("ocrb"), bundle: Bundle(url: Bundle(for: MRZScannerView.self).url(forResource: "TraineedDataBundle", withExtension: "bundle")!)!, engineMode: .tesseractLstmCombined)
-    
+    // OCR is now centralized in MrzImageOcr.shared (used by both live and static paths).
     fileprivate let captureSession = AVCaptureSession()
     fileprivate let videoOutput = AVCaptureVideoDataOutput()
     fileprivate let photoOutput = AVCapturePhotoOutput()
     fileprivate let videoPreviewLayer = AVCaptureVideoPreviewLayer()
     fileprivate var isScanningPaused = false
     fileprivate var observer: NSKeyValueObservation?
+    // Drop-while-busy throttle: while OCR is in flight on `ocrQueue`, new
+    // frames are dropped at captureOutput entry — preview queue stays free.
+    private let ocrSemaphore = DispatchSemaphore(value: 1)
+    private let ocrQueue = DispatchQueue(label: "mrz_ocr_queue", qos: .userInitiated)
+    // Reused across frames; safe because the upstream serial frame queue
+    // (video_frames_queue) and this serial ocrQueue together guarantee
+    // non-concurrent perform() calls on this VNRequest. Do NOT share this
+    // instance with the static path — that path uses its own VNRequest in
+    // MrzImageOcr.detectMrzRegion.
+    private lazy var textDetectionRequest: VNDetectTextRectanglesRequest = {
+        let r = VNDetectTextRectanglesRequest()
+        r.reportCharacterBoxes = false
+        return r
+    }()
     @objc public dynamic var isScanning = false
     public weak var delegate: MRZScannerViewDelegate?
     private var photoData: Data?
@@ -109,36 +121,12 @@ public class MRZScannerView: UIView {
     // MARK: MRZ
     // EDIT: Updated mrz(from:) to perform pre‑processing (grayscale & thresholding) before OCR.
     fileprivate func mrz(from cgImage: CGImage) -> String? {
-        // Convert CGImage to UIImage and preprocess
-        let originalImage = UIImage(cgImage: cgImage)
-        let preprocessedImage = preprocessImage(originalImage)
-        
-        var recognizedString: String?
-        // Using Tesseract OCR on the preprocessed image.
-        tesseract.performOCR(on: preprocessedImage) { recognizedString = $0 }
-        return recognizedString
+        return MrzImageOcr.shared.performOcr(on: cgImage)
     }
-    
+
     // MARK: Preprocessing
-    // EDIT: Added a preprocessing function to mimic the grayscale conversion and thresholding in Android.
     fileprivate func preprocessImage(_ image: UIImage) -> UIImage {
-        // Convert to grayscale using Core Image
-        guard let cgImage = image.cgImage else { return image }
-        let ciImage = CIImage(cgImage: cgImage)
-        let grayscale = ciImage.applyingFilter("CIColorControls", parameters: [kCIInputSaturationKey: 0])
-        
-        // Apply a threshold filter.
-        // Note: Core Image does not have a built-in threshold filter,
-        // so for simplicity we simulate it by adjusting contrast.
-        let threshold = grayscale.applyingFilter("CIColorControls", parameters: [
-            kCIInputContrastKey: 4.0  // Increase contrast to mimic thresholding
-        ])
-        
-        let context = CIContext(options: nil)
-        if let outputCGImage = context.createCGImage(threshold, from: threshold.extent) {
-            return UIImage(cgImage: outputCGImage)
-        }
-        return image
+        return MrzImageOcr.shared.preprocess(image)
     }
     
     // MARK: Document Image from Photo cropping
@@ -311,44 +299,45 @@ fileprivate func calculateCutoutRect(for imageSize: CGSize, cropToMRZ: Bool) -> 
 // MARK: - AVCaptureVideoDataOutputSampleBufferDelegate
 extension MRZScannerView: AVCaptureVideoDataOutputSampleBufferDelegate {
     public func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        // Drop-while-busy: skip this frame if a previous OCR is still running
+        // on `ocrQueue`. Preserves preview FPS by keeping the frame queue free.
+        guard ocrSemaphore.wait(timeout: .now()) == .success else { return }
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
               let cgImage = pixelBuffer.cgImage else {
+            ocrSemaphore.signal()
             return
         }
-        
-        // EDIT: Crop the full frame to the document area.
+
+        // EDIT: Crop the full frame to the document area (cheap, on frame queue).
         let documentImage = self.documentImage(from: cgImage)
-        let imageRequestHandler = VNImageRequestHandler(cgImage: documentImage, options: [:])
-        
-        let detectTextRectangles = VNDetectTextRectanglesRequest { [unowned self] request, error in
-            guard error == nil else {
+        // Move heavy Vision + Tesseract work off the frame queue so the
+        // capture pipeline isn't blocked by OCR latency.
+        ocrQueue.async { [weak self] in
+            guard let self = self else { return }
+            defer { self.ocrSemaphore.signal() }
+
+            let imageRequestHandler = VNImageRequestHandler(cgImage: documentImage, options: [:])
+            do {
+                try imageRequestHandler.perform([self.textDetectionRequest])
+            } catch {
                 return
             }
-            
-            guard let results = request.results as? [VNTextObservation] else {
-                return
-            }
-            
+            guard let results = self.textDetectionRequest.results as? [VNTextObservation] else { return }
+
             let imageWidth = CGFloat(documentImage.width)
             let imageHeight = CGFloat(documentImage.height)
             let transform = CGAffineTransform.identity.scaledBy(x: imageWidth, y: -imageHeight).translatedBy(x: 0, y: -1)
             let mrzTextRectangles = results.map({ $0.boundingBox.applying(transform) }).filter({ $0.width > (imageWidth * 0.8) })
             let mrzRegionRect = mrzTextRectangles.reduce(into: CGRect.null, { $0 = $0.union($1) })
-            
-            // EDIT: Only process if the region is not too tall (similar to Android's check).
-            guard mrzRegionRect.height <= (imageHeight * 0.4) else {
-                return
-            }
-            
-            if let mrzTextImage = documentImage.cropping(to: mrzRegionRect) {
-                // Perform OCR on the cropped & preprocessed MRZ region.
-                if let mrzResult = self.mrz(from: mrzTextImage) {
-                    self.delegate?.onParse(mrzResult)
-                }
+
+            // Only process if the region is not too tall (mirror Android check).
+            guard mrzRegionRect.height <= (imageHeight * 0.4) else { return }
+
+            if let mrzTextImage = documentImage.cropping(to: mrzRegionRect),
+               let mrzResult = self.mrz(from: mrzTextImage) {
+                DispatchQueue.main.async { self.delegate?.onParse(mrzResult) }
             }
         }
-        
-        try? imageRequestHandler.perform([detectTextRectangles])
     }
 }
 
@@ -372,7 +361,7 @@ extension MRZScannerView: AVCapturePhotoCaptureDelegate {
             
             // EDIT: Adjust the rotation using the updated orientation.
             let cgImage = photo.cgImageRepresentation()!
-            let rotated = createMatchingBackingDataWithImage(imageRef: cgImage, orienation: uiOrientation)
+            let rotated = createMatchingBackingDataWithImage(imageRef: cgImage, orientation: uiOrientation)
             let resized = resize(rotated!)
             if self.shouldCrop {
                 // Crop the image to the document area.
@@ -409,99 +398,19 @@ extension MRZScannerView: AVCapturePhotoCaptureDelegate {
         }
     }
     
-    func createMatchingBackingDataWithImage(imageRef: CGImage?, orienation: UIImage.Orientation) -> CGImage? {
-        var orientedImage: CGImage?
-        
-        if let imageRef = imageRef {
-            let originalWidth = imageRef.width
-            let originalHeight = imageRef.height
-            let bitsPerComponent = imageRef.bitsPerComponent
-            let bytesPerRow = imageRef.bytesPerRow
-            
-            let bitmapInfo = imageRef.bitmapInfo
-            
-            guard let colorSpace = imageRef.colorSpace else {
-                return nil
-            }
-            
-            var degreesToRotate: Double
-            var swapWidthHeight: Bool
-            var mirrored: Bool
-            switch orienation {
-            case .up:
-                degreesToRotate = 0.0
-                swapWidthHeight = false
-                mirrored = false
-            case .upMirrored:
-                degreesToRotate = 0.0
-                swapWidthHeight = false
-                mirrored = true
-            case .right:
-                degreesToRotate = 90.0
-                swapWidthHeight = true
-                mirrored = false
-            case .rightMirrored:
-                degreesToRotate = 90.0
-                swapWidthHeight = true
-                mirrored = true
-            case .down:
-                degreesToRotate = 180.0
-                swapWidthHeight = false
-                mirrored = false
-            case .downMirrored:
-                degreesToRotate = 180.0
-                swapWidthHeight = false
-                mirrored = true
-            case .left:
-                degreesToRotate = -90.0
-                swapWidthHeight = true
-                mirrored = false
-            case .leftMirrored:
-                degreesToRotate = -90.0
-                swapWidthHeight = true
-                mirrored = true
-            @unknown default:
-                degreesToRotate = 0.0
-                swapWidthHeight = false
-                mirrored = false
-            }
-            let radians = degreesToRotate * Double.pi / 180.0
-            
-            var width: Int
-            var height: Int
-            if swapWidthHeight {
-                width = originalHeight
-                height = originalWidth
-            } else {
-                width = originalWidth
-                height = originalHeight
-            }
-            
-            let contextRef = CGContext(data: nil, width: width, height: height, bitsPerComponent: bitsPerComponent, bytesPerRow: bytesPerRow, space: colorSpace, bitmapInfo: bitmapInfo.rawValue)
-            contextRef?.translateBy(x: CGFloat(width) / 2.0, y: CGFloat(height) / 2.0)
-            if mirrored {
-                contextRef?.scaleBy(x: -1.0, y: 1.0)
-            }
-            contextRef?.rotate(by: CGFloat(radians))
-            if swapWidthHeight {
-                contextRef?.translateBy(x: -CGFloat(height) / 2.0, y: -CGFloat(width) / 2.0)
-            } else {
-                contextRef?.translateBy(x: -CGFloat(width) / 2.0, y: -CGFloat(height) / 2.0)
-            }
-            contextRef?.draw(imageRef, in: CGRect(x: 0.0, y: 0.0, width: CGFloat(originalWidth), height: CGFloat(originalHeight)))
-            orientedImage = contextRef?.makeImage()
-        }
-        
-        return orientedImage
-    }
-    
     func resize(_ image: CGImage) -> CGImage? {
         var ratio: Float = 0.0
         let imageWidth = Float(image.width)
         let imageHeight = Float(image.height)
         let maxWidth: Float = 720.0
         let maxHeight: Float = 1280.0
-        
+
+        // Skip resize when already within target bounds — avoid an
+        // unnecessary CGContext allocation + per-pixel draw.
+        if imageWidth <= maxWidth && imageHeight <= maxHeight {
+            return image
+        }
+
         // Get ratio (landscape or portrait)
         if imageWidth > imageHeight {
             ratio = maxWidth / imageWidth
