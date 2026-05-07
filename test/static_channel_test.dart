@@ -47,4 +47,30 @@ void main() {
     expect(result!.mrz, td3);
     expect(result.mrzResult.documentNumber, 'L898902C3');
   });
+
+  test(
+      'scanImage forwards multi-line OCR output through mrz_parser without '
+      'throwing, even when non-MRZ noise leaks through native filtering',
+      () async {
+    // Phase 3: modern OCR engines (iOS Vision, Android MLKit) recognize
+    // whole-image text and may return non-MRZ lines mixed with the MRZ
+    // band. The native side filters MRZ-shape candidates before forwarding,
+    // but if some noise leaks through, the Dart side MUST handle it
+    // gracefully — never throwing — and return null when mrz_parser
+    // cannot parse the candidate set.
+    const noisyMrz =
+        'REPUBLIC OF UTOPIA\n'
+        'P<UTOERIKSSON<<ANNA<MARIA<<<<<<<<<<<<<<<<<<<\n'
+        'PASSPORT\n'
+        'L898902C36UTO7408122F1204159ZE184226B<<<<<10\n'
+        'See page 2';
+    messenger.setMockMethodCallHandler(channel, (_) async => noisyMrz);
+
+    // Must not throw — this is the channel contract guard. Whether the
+    // parser recovers or returns null is mrz_parser's call; the channel
+    // forwarding just has to be robust.
+    final result = await MRZScanner.scanImage(Uint8List(0));
+    expect(result, anyOf(isNull, isA<MRZFullResult>()),
+        reason: 'forwarding must not throw on multi-line noisy input');
+  });
 }
