@@ -188,9 +188,17 @@ class FotoapparatCamera constructor(
         // that we also skip the per-pixel preprocessing cost when busy.
         if (!ocrInFlight.compareAndSet(false, true)) return
         val processedBitmap: Bitmap = try {
-            val bitmap = getImage(frame)
+            // Direct NV21 Y-plane → binarized + rotated bitmap. Already
+            // grayscale + thresholded — preprocessImage() is redundant on
+            // the live path now.
+            val bitmap = nv21ToBinaryBitmap(frame)
             val cropped = calculateCutoutRectCardSize(bitmap, true)
-            preprocessImage(cropped)
+            // calculateCutoutRectCardSize may return the source itself if
+            // crop matches the full bitmap; only recycle when distinct.
+            if (cropped !== bitmap) {
+                try { bitmap.recycle() } catch (_: Throwable) {}
+            }
+            cropped
         } catch (t: Throwable) {
             ocrInFlight.set(false)
             throw t
@@ -211,13 +219,71 @@ class FotoapparatCamera constructor(
         }
     }
 
-    private fun getImage(frame: Frame): Bitmap {
+    /**
+     * Legacy fallback: YuvImage → JPEG → Bitmap roundtrip. Retained so
+     * [nv21ToBinaryBitmap] can fall back if a device delivers an unexpected
+     * NV21 buffer size (stride/padding).
+     */
+    private fun getImageJpeg(frame: Frame): Bitmap {
         val out = ByteArrayOutputStream()
         val yuvImage = YuvImage(frame.image, ImageFormat.NV21, frame.size.width, frame.size.height, null)
         yuvImage.compressToJpeg(Rect(0, 0, frame.size.width, frame.size.height), 100, out)
         val imageBytes = out.toByteArray()
         val image = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
         return rotateBitmap(image, -frame.rotation)
+    }
+
+    /**
+     * Convert NV21 frame's Y plane directly to a binarized ARGB_8888 Bitmap
+     * (BLACK / WHITE), applying the same threshold (128) as MrzOcr.preprocess
+     * AND rotating to upright via index math. Single allocation, single
+     * pass — eliminates the YUV → JPEG → Bitmap roundtrip plus the
+     * grayscale + threshold passes.
+     *
+     * Falls back to [getImageJpeg] if the buffer is smaller than expected
+     * (defensive guard against stride/padding surprises).
+     */
+    private fun nv21ToBinaryBitmap(frame: Frame, threshold: Int = 128): Bitmap {
+        val w = frame.size.width
+        val h = frame.size.height
+        val y = frame.image
+        if (y.size < w * h) {
+            Log.w(
+                "FotoapparatCamera",
+                "Unexpected NV21 buffer size ${y.size} (expected >= ${w * h}); falling back to JPEG path"
+            )
+            return getImageJpeg(frame)
+        }
+        val rot = frame.rotation
+        val outW: Int
+        val outH: Int
+        if (rot == 90 || rot == 270) {
+            outW = h
+            outH = w
+        } else {
+            outW = w
+            outH = h
+        }
+        val pixels = IntArray(outW * outH)
+        val black = Color.BLACK
+        val white = Color.WHITE
+        for (j in 0 until outH) {
+            for (i in 0 until outW) {
+                val sx: Int
+                val sy: Int
+                when (rot) {
+                    90 -> { sx = j;          sy = w - 1 - i }
+                    180 -> { sx = w - 1 - i; sy = h - 1 - j }
+                    270 -> { sx = h - 1 - j; sy = i }
+                    else -> { sx = i;        sy = j }
+                }
+                val luma = y[sy * w + sx].toInt() and 0xFF
+                pixels[j * outW + i] = if (luma < threshold) black else white
+            }
+        }
+        val bmp = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
+        bmp.setPixels(pixels, 0, outW, 0, 0, outW, outH)
+        return bmp
     }
 
     private fun rotateBitmap(source: Bitmap, angle: Int): Bitmap {
