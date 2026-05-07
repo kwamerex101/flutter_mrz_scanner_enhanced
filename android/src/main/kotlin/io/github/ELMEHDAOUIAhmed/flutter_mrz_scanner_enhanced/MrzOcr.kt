@@ -29,6 +29,7 @@ import java.util.concurrent.TimeUnit
  * into `context.cacheDir/tessdata/` and reused for the lifetime of the process.
  */
 object MrzOcr {
+    private const val TAG = "MrzOcr"
     private const val TESS_LANG = "ocrb"
     private const val TESS_WHITELIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<"
     private val PAGE_SEG_MODE = TessBaseAPI.PageSegMode.PSM_SINGLE_BLOCK
@@ -152,7 +153,12 @@ object MrzOcr {
             var failure: Exception? = null
             recognizer.process(input)
                 .addOnSuccessListener { text ->
+                    android.util.Log.d(
+                        TAG,
+                        "MLKit raw text (len=${text.text.length}): ${text.text.take(800)}"
+                    )
                     resultText = filterMrzLines(text.text)
+                    android.util.Log.d(TAG, "filterMrzLines result: $resultText")
                     latch.countDown()
                 }
                 .addOnFailureListener { e ->
@@ -170,26 +176,86 @@ object MrzOcr {
         }
     }
 
-    /** Filter MLKit's recognized text down to MRZ-shaped lines. */
+    /** Filter MLKit's recognized text down to MRZ-shaped lines.
+     *
+     *  Strategy:
+     *    1. Normalize each line (strip spaces, alias `«` → `<`, uppercase).
+     *    2. Strip any chars outside the MRZ alphabet `[A-Z0-9<]`. MLKit
+     *       sometimes interleaves stray punctuation (`.`, `:`, `-`, `—`)
+     *       with valid MRZ characters; rejecting the whole line on a single
+     *       outlier was producing false negatives on real passport photos.
+     *    3. Keep lines whose stripped form is ≥ 28 chars (TD1 minimum is 30,
+     *       small slack for edge OCR slop) and contains at least one `<` or
+     *       digit. Plain prose rarely satisfies that — `mrz_parser` validates
+     *       check digits downstream, so a slightly-loose filter is safe.
+     *    4. Repair filler regions — MLKit frequently misreads the `<` filler
+     *       characters in MRZ as letters (`K`, `C`, `E`, etc.), which breaks
+     *       check digits. See [repairMrzFiller].
+     */
     private fun filterMrzLines(raw: String): String? {
         val mrzLines = raw.split('\n').mapNotNull { line ->
             val normalized = line
                 .replace(" ", "")
                 .replace("«", "<")
                 .uppercase()
-            // MRZ alphabet is A-Z, 0-9, < — anything else disqualifies.
-            // Shortest valid MRZ line is TD1 at 30 chars; allow a small
-            // tolerance for OCR slop on edge characters.
-            if (normalized.length >= 28 &&
-                normalized.all { it.isLetterOrDigit() || it == '<' } &&
-                normalized.any { it == '<' || it.isDigit() }
-            ) {
-                normalized
+            // Strip anything outside the MRZ alphabet rather than reject the
+            // whole line on a stray symbol from MLKit.
+            val stripped = buildString {
+                for (c in normalized) {
+                    when {
+                        c == '<' -> append(c)
+                        c in 'A'..'Z' -> append(c)
+                        c in '0'..'9' -> append(c)
+                    }
+                }
+            }
+            val hasMrzMarker = stripped.any { it == '<' || it.isDigit() }
+            android.util.Log.d(
+                TAG,
+                "cand raw=\"$line\" norm=\"$normalized\" stripped=\"$stripped\" " +
+                        "len=${stripped.length} hasMarker=$hasMrzMarker"
+            )
+            if (stripped.length >= 28 && hasMrzMarker) {
+                val repaired = repairMrzFiller(stripped)
+                if (repaired != stripped) {
+                    android.util.Log.d(TAG, "repaired filler: \"$stripped\" -> \"$repaired\"")
+                }
+                repaired
             } else {
                 null
             }
         }
         return if (mrzLines.isEmpty()) null else mrzLines.joinToString("\n")
+    }
+
+    /**
+     * Replace stray letters in the MRZ filler region with `<`.
+     *
+     * MLKit (and to a lesser extent every neural OCR) misreads the angle-
+     * bracket filler `<` as letters like `K`, `C`, `E`, `c`, `e`, `k` on
+     * real-world passport photos. Those false letters break the check
+     * digits in `mrz_parser` even when every other character is correct.
+     *
+     * The filler region is identified by the start of the first run of
+     * three or more consecutive `<` characters. Everything from that point
+     * to the end of the line is treated as filler — non-`<` non-digit
+     * characters there are replaced with `<`.
+     *
+     * Digits are preserved because the final composite check digit at the
+     * end of TD3 line 2 sits inside the filler region. Letters before the
+     * first `<<<+` run are left alone because that's where doc type,
+     * country, name, dates, and sex live.
+     */
+    private fun repairMrzFiller(line: String): String {
+        val match = Regex("<{3,}").find(line) ?: return line
+        val fillerStart = match.range.first
+        val chars = line.toCharArray()
+        for (i in fillerStart until chars.size) {
+            val c = chars[i]
+            if (c == '<' || c.isDigit()) continue
+            chars[i] = '<'
+        }
+        return String(chars)
     }
 
     /** Grayscale + binary threshold (port of FotoapparatCamera.preprocessImage). */
