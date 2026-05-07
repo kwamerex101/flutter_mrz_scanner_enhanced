@@ -28,8 +28,6 @@ class FotoapparatCamera constructor(
     val context: Context,
     var messenger: MethodChannel
 ) {
-    private val DEFAULT_PAGE_SEG_MODE = TessBaseAPI.PageSegMode.PSM_SINGLE_BLOCK
-    private var cachedTessData: File? = null
     private var mainExecutor = ContextCompat.getMainExecutor(context)
     private val job = SupervisorJob()
     private val scope = CoroutineScope(Dispatchers.IO + job)
@@ -56,9 +54,7 @@ class FotoapparatCamera constructor(
     )
 
     init {
-        if (cachedTessData == null) {
-            cachedTessData = getFileFromAssets(context, fileName = "ocrb.traineddata")
-        }
+        MrzOcr.ensureTrainedData(context)
     }
 
     fun flashlightOn() {
@@ -213,40 +209,12 @@ class FotoapparatCamera constructor(
 
     // Preprocess the image by converting it to grayscale and applying a simple threshold.
     private fun preprocessImage(bitmap: Bitmap): Bitmap {
-        // Convert to grayscale.
-        val grayscale = Bitmap.createBitmap(bitmap.width, bitmap.height, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(grayscale)
-        val paint = Paint()
-        val colorMatrix = ColorMatrix().apply { setSaturation(0f) }
-        paint.colorFilter = ColorMatrixColorFilter(colorMatrix)
-        canvas.drawBitmap(bitmap, 0f, 0f, paint)
-
-        // Apply thresholding.
-        val threshold = 128
-        val width = grayscale.width
-        val height = grayscale.height
-        val pixels = IntArray(width * height)
-        grayscale.getPixels(pixels, 0, width, 0, 0, width, height)
-        for (i in pixels.indices) {
-            val gray = Color.red(pixels[i])  // For grayscale images, R=G=B.
-            pixels[i] = if (gray < threshold) Color.BLACK else Color.WHITE
-        }
-        val processed = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        processed.setPixels(pixels, 0, width, 0, 0, width, height)
-        return processed
+        return MrzOcr.preprocess(bitmap)
     }
 
     // Run OCR using Tesseract on the provided bitmap.
     private fun scanMRZ(bitmap: Bitmap): String {
-        val baseApi = TessBaseAPI()
-        baseApi.init(context.cacheDir.absolutePath, "ocrb")
-        // Set Tesseract to recognize only MRZ-valid characters.
-        baseApi.setVariable("tessedit_char_whitelist", "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<")
-        baseApi.pageSegMode = DEFAULT_PAGE_SEG_MODE
-        baseApi.setImage(bitmap)
-        val mrz = baseApi.utF8Text
-        baseApi.stop()
-        return mrz
+        return MrzOcr.runTesseract(context, bitmap) ?: ""
     }
 
     private fun extractMRZ(input: String): String {
@@ -254,19 +222,6 @@ class FotoapparatCamera constructor(
         val mrzLength = lines.last().length
         val mrzLines = lines.takeLastWhile { it.length == mrzLength }
         return mrzLines.joinToString("\n")
-    }
-
-    @Throws(IOException::class)
-    fun getFileFromAssets(context: Context, fileName: String): File {
-        val directory = File(context.cacheDir, "tessdata/")
-        directory.mkdir()
-        return File(directory, fileName).also { file ->
-            file.outputStream().use { cache ->
-                context.assets.open(fileName).use { stream -> 
-                    stream.copyTo(cache)
-                }
-            }
-        }
     }
 
 /**
