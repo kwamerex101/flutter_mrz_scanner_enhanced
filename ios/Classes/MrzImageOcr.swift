@@ -74,13 +74,21 @@ final class MrzImageOcr {
         // Bias toward MRZ filler. Harmless if not present in the image.
         request.customWords = ["<<", "<<<"]
 
-        do { try handler.perform([request]) } catch { return nil }
+        do { try handler.perform([request]) } catch {
+            print("[MrzImageOcr] Vision perform failed: \(error)")
+            return nil
+        }
         guard let observations = request.results as? [VNRecognizedTextObservation],
-              !observations.isEmpty else { return nil }
+              !observations.isEmpty else {
+            print("[MrzImageOcr] Vision returned 0 observations")
+            return nil
+        }
 
         // Each observation = one detected line. Sort top-to-bottom in image
         // coordinates (Vision uses bottom-left origin, so larger minY = higher).
         let sorted = observations.sorted { $0.boundingBox.minY > $1.boundingBox.minY }
+
+        print("[MrzImageOcr] Vision returned \(sorted.count) observations")
 
         let mrzLines: [String] = sorted.compactMap { obs in
             guard let raw = obs.topCandidates(1).first?.string else { return nil }
@@ -91,18 +99,46 @@ final class MrzImageOcr {
                 .replacingOccurrences(of: " ", with: "")
                 .replacingOccurrences(of: "«", with: "<")
                 .uppercased()
+            let len = normalized.count
+            let alphabetOk = normalized.allSatisfy({
+                ($0.isLetter && $0.isASCII) || $0.isNumber || $0 == "<"
+            })
+            print("[MrzImageOcr] cand raw=\"\(raw)\" norm=\"\(normalized)\" len=\(len) alphabetOk=\(alphabetOk)")
             // MRZ alphabet is A-Z, 0-9, < — anything else disqualifies.
             // Shortest valid MRZ line is TD1 at 30 chars; allow a small
             // tolerance for OCR slop on edge characters.
-            guard normalized.count >= 28,
-                  normalized.allSatisfy({ ($0.isLetter && $0.isASCII) || $0.isNumber || $0 == "<" }) else {
-                return nil
-            }
+            guard len >= 28, alphabetOk else { return nil }
             return normalized
         }
 
+        print("[MrzImageOcr] passed-filter MRZ lines: \(mrzLines.count)")
         guard !mrzLines.isEmpty else { return nil }
-        return mrzLines.joined(separator: "\n")
+
+        // Structural sort: the spatial top-to-bottom order from Vision can
+        // be unreliable on passport photos because the MRZ sits at the
+        // bottom of the page (lower minY in lower-left-origin coords) and
+        // Vision sometimes returns observations in reverse depending on
+        // the EXIF rotation applied. Sort by content shape instead:
+        //   TD3 line 1: `P<COUNTRY<<NAMES…` → second char is a letter
+        //               or `<`.
+        //   TD3 line 2: starts with the document number → second char
+        //               is typically a digit.
+        // Lines whose second char is non-digit come first.
+        let ordered = mrzLines.sorted { a, b in
+            return Self.mrzLineRank(a) < Self.mrzLineRank(b)
+        }
+
+        return ordered.joined(separator: "\n")
+    }
+
+    /// Lower rank = earlier in document order.
+    /// 0 → likely TD3 line 1 (second char letter/`<`)
+    /// 1 → likely TD3 line 2 (second char digit) — or any line we
+    ///      can't classify.
+    private static func mrzLineRank(_ line: String) -> Int {
+        guard line.count > 1 else { return 1 }
+        let second = line[line.index(line.startIndex, offsetBy: 1)]
+        return (second.isLetter || second == "<") ? 0 : 1
     }
 
     private static func applyExif(_ cgImage: CGImage, source: CGImageSource) -> CGImage {
