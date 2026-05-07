@@ -37,6 +37,10 @@ class FotoapparatCamera constructor(
     // path's MrzOcr.acquireSharedBaseApi(...) — see CONTEXT.md.
     private var tessApi: TessBaseAPI? = null
     private val tessLock = Any()
+    // Drop-while-busy throttle: while OCR is in flight on `scope`, new
+    // frames are dropped at processFrame entry — no preprocessing, no
+    // bitmap allocation, no coroutine launch.
+    private val ocrInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
 
     val cameraView = CameraView(context)
 
@@ -180,22 +184,31 @@ class FotoapparatCamera constructor(
 
     // Process the full frame: apply pre‑processing and OCR without cropping.
     private fun processFrame(frame: Frame) {
-        val bitmap = getImage(frame)
-        //val cropped = calculateCutoutRect(bitmap, true)
-        // Preprocess the full image (convert to grayscale and apply thresholding) to improve OCR.
-        val cropped = calculateCutoutRectCardSize(bitmap, true)
-        val processedBitmap = preprocessImage(cropped)
-       
-
-
-        scope.launch {
-        val mrzText = scanMRZ(processedBitmap)
-        val fixedMrz = extractMRZ(mrzText)
-
-        withContext(Dispatchers.Main) {
-            messenger.invokeMethod("onParsed", fixedMrz)
+        // Drop frames while a previous OCR is still running. Gate FIRST so
+        // that we also skip the per-pixel preprocessing cost when busy.
+        if (!ocrInFlight.compareAndSet(false, true)) return
+        val processedBitmap: Bitmap = try {
+            val bitmap = getImage(frame)
+            val cropped = calculateCutoutRectCardSize(bitmap, true)
+            preprocessImage(cropped)
+        } catch (t: Throwable) {
+            ocrInFlight.set(false)
+            throw t
         }
-    }
+        scope.launch {
+            try {
+                val mrzText = scanMRZ(processedBitmap)
+                val fixedMrz = extractMRZ(mrzText)
+                withContext(Dispatchers.Main) {
+                    messenger.invokeMethod("onParsed", fixedMrz)
+                }
+            } finally {
+                // Recycle the per-frame bitmap (Tesseract.setImage copies
+                // pixels into Pix; we own the Bitmap from here).
+                try { processedBitmap.recycle() } catch (_: Throwable) {}
+                ocrInFlight.set(false)
+            }
+        }
     }
 
     private fun getImage(frame: Frame): Bitmap {
