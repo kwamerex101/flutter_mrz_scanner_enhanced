@@ -11,9 +11,7 @@ public protocol MRZScannerViewDelegate: AnyObject {
 }
 
 public class MRZScannerView: UIView {
-    // EDIT: Initialized Tesseract with the ocrb language.
-    fileprivate let tesseract = SwiftyTesseract(language: .custom("ocrb"), bundle: Bundle(url: Bundle(for: MRZScannerView.self).url(forResource: "TraineedDataBundle", withExtension: "bundle")!)!, engineMode: .tesseractLstmCombined)
-    
+    // OCR is now centralized in MrzImageOcr.shared (used by both live and static paths).
     fileprivate let captureSession = AVCaptureSession()
     fileprivate let videoOutput = AVCaptureVideoDataOutput()
     fileprivate let photoOutput = AVCapturePhotoOutput()
@@ -109,36 +107,12 @@ public class MRZScannerView: UIView {
     // MARK: MRZ
     // EDIT: Updated mrz(from:) to perform pre‑processing (grayscale & thresholding) before OCR.
     fileprivate func mrz(from cgImage: CGImage) -> String? {
-        // Convert CGImage to UIImage and preprocess
-        let originalImage = UIImage(cgImage: cgImage)
-        let preprocessedImage = preprocessImage(originalImage)
-        
-        var recognizedString: String?
-        // Using Tesseract OCR on the preprocessed image.
-        tesseract.performOCR(on: preprocessedImage) { recognizedString = $0 }
-        return recognizedString
+        return MrzImageOcr.shared.performOcr(on: cgImage)
     }
-    
+
     // MARK: Preprocessing
-    // EDIT: Added a preprocessing function to mimic the grayscale conversion and thresholding in Android.
     fileprivate func preprocessImage(_ image: UIImage) -> UIImage {
-        // Convert to grayscale using Core Image
-        guard let cgImage = image.cgImage else { return image }
-        let ciImage = CIImage(cgImage: cgImage)
-        let grayscale = ciImage.applyingFilter("CIColorControls", parameters: [kCIInputSaturationKey: 0])
-        
-        // Apply a threshold filter.
-        // Note: Core Image does not have a built-in threshold filter,
-        // so for simplicity we simulate it by adjusting contrast.
-        let threshold = grayscale.applyingFilter("CIColorControls", parameters: [
-            kCIInputContrastKey: 4.0  // Increase contrast to mimic thresholding
-        ])
-        
-        let context = CIContext(options: nil)
-        if let outputCGImage = context.createCGImage(threshold, from: threshold.extent) {
-            return UIImage(cgImage: outputCGImage)
-        }
-        return image
+        return MrzImageOcr.shared.preprocess(image)
     }
     
     // MARK: Document Image from Photo cropping
@@ -372,7 +346,7 @@ extension MRZScannerView: AVCapturePhotoCaptureDelegate {
             
             // EDIT: Adjust the rotation using the updated orientation.
             let cgImage = photo.cgImageRepresentation()!
-            let rotated = createMatchingBackingDataWithImage(imageRef: cgImage, orienation: uiOrientation)
+            let rotated = createMatchingBackingDataWithImage(imageRef: cgImage, orientation: uiOrientation)
             let resized = resize(rotated!)
             if self.shouldCrop {
                 // Crop the image to the document area.
@@ -407,92 +381,6 @@ extension MRZScannerView: AVCapturePhotoCaptureDelegate {
         } catch {
             print("Error saving image to temporary storage: \(error)")
         }
-    }
-    
-    func createMatchingBackingDataWithImage(imageRef: CGImage?, orienation: UIImage.Orientation) -> CGImage? {
-        var orientedImage: CGImage?
-        
-        if let imageRef = imageRef {
-            let originalWidth = imageRef.width
-            let originalHeight = imageRef.height
-            let bitsPerComponent = imageRef.bitsPerComponent
-            let bytesPerRow = imageRef.bytesPerRow
-            
-            let bitmapInfo = imageRef.bitmapInfo
-            
-            guard let colorSpace = imageRef.colorSpace else {
-                return nil
-            }
-            
-            var degreesToRotate: Double
-            var swapWidthHeight: Bool
-            var mirrored: Bool
-            switch orienation {
-            case .up:
-                degreesToRotate = 0.0
-                swapWidthHeight = false
-                mirrored = false
-            case .upMirrored:
-                degreesToRotate = 0.0
-                swapWidthHeight = false
-                mirrored = true
-            case .right:
-                degreesToRotate = 90.0
-                swapWidthHeight = true
-                mirrored = false
-            case .rightMirrored:
-                degreesToRotate = 90.0
-                swapWidthHeight = true
-                mirrored = true
-            case .down:
-                degreesToRotate = 180.0
-                swapWidthHeight = false
-                mirrored = false
-            case .downMirrored:
-                degreesToRotate = 180.0
-                swapWidthHeight = false
-                mirrored = true
-            case .left:
-                degreesToRotate = -90.0
-                swapWidthHeight = true
-                mirrored = false
-            case .leftMirrored:
-                degreesToRotate = -90.0
-                swapWidthHeight = true
-                mirrored = true
-            @unknown default:
-                degreesToRotate = 0.0
-                swapWidthHeight = false
-                mirrored = false
-            }
-            let radians = degreesToRotate * Double.pi / 180.0
-            
-            var width: Int
-            var height: Int
-            if swapWidthHeight {
-                width = originalHeight
-                height = originalWidth
-            } else {
-                width = originalWidth
-                height = originalHeight
-            }
-            
-            let contextRef = CGContext(data: nil, width: width, height: height, bitsPerComponent: bitsPerComponent, bytesPerRow: bytesPerRow, space: colorSpace, bitmapInfo: bitmapInfo.rawValue)
-            contextRef?.translateBy(x: CGFloat(width) / 2.0, y: CGFloat(height) / 2.0)
-            if mirrored {
-                contextRef?.scaleBy(x: -1.0, y: 1.0)
-            }
-            contextRef?.rotate(by: CGFloat(radians))
-            if swapWidthHeight {
-                contextRef?.translateBy(x: -CGFloat(height) / 2.0, y: -CGFloat(width) / 2.0)
-            } else {
-                contextRef?.translateBy(x: -CGFloat(width) / 2.0, y: -CGFloat(height) / 2.0)
-            }
-            contextRef?.draw(imageRef, in: CGRect(x: 0.0, y: 0.0, width: CGFloat(originalWidth), height: CGFloat(originalHeight)))
-            orientedImage = contextRef?.makeImage()
-        }
-        
-        return orientedImage
     }
     
     func resize(_ image: CGImage) -> CGImage? {
