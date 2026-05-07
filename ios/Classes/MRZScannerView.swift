@@ -18,6 +18,20 @@ public class MRZScannerView: UIView {
     fileprivate let videoPreviewLayer = AVCaptureVideoPreviewLayer()
     fileprivate var isScanningPaused = false
     fileprivate var observer: NSKeyValueObservation?
+    // Drop-while-busy throttle: while OCR is in flight on `ocrQueue`, new
+    // frames are dropped at captureOutput entry — preview queue stays free.
+    private let ocrSemaphore = DispatchSemaphore(value: 1)
+    private let ocrQueue = DispatchQueue(label: "mrz_ocr_queue", qos: .userInitiated)
+    // Reused across frames; safe because the upstream serial frame queue
+    // (video_frames_queue) and this serial ocrQueue together guarantee
+    // non-concurrent perform() calls on this VNRequest. Do NOT share this
+    // instance with the static path — that path uses its own VNRequest in
+    // MrzImageOcr.detectMrzRegion.
+    private lazy var textDetectionRequest: VNDetectTextRectanglesRequest = {
+        let r = VNDetectTextRectanglesRequest()
+        r.reportCharacterBoxes = false
+        return r
+    }()
     @objc public dynamic var isScanning = false
     public weak var delegate: MRZScannerViewDelegate?
     private var photoData: Data?
@@ -285,44 +299,45 @@ fileprivate func calculateCutoutRect(for imageSize: CGSize, cropToMRZ: Bool) -> 
 // MARK: - AVCaptureVideoDataOutputSampleBufferDelegate
 extension MRZScannerView: AVCaptureVideoDataOutputSampleBufferDelegate {
     public func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        // Drop-while-busy: skip this frame if a previous OCR is still running
+        // on `ocrQueue`. Preserves preview FPS by keeping the frame queue free.
+        guard ocrSemaphore.wait(timeout: .now()) == .success else { return }
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
               let cgImage = pixelBuffer.cgImage else {
+            ocrSemaphore.signal()
             return
         }
-        
-        // EDIT: Crop the full frame to the document area.
+
+        // EDIT: Crop the full frame to the document area (cheap, on frame queue).
         let documentImage = self.documentImage(from: cgImage)
-        let imageRequestHandler = VNImageRequestHandler(cgImage: documentImage, options: [:])
-        
-        let detectTextRectangles = VNDetectTextRectanglesRequest { [unowned self] request, error in
-            guard error == nil else {
+        // Move heavy Vision + Tesseract work off the frame queue so the
+        // capture pipeline isn't blocked by OCR latency.
+        ocrQueue.async { [weak self] in
+            guard let self = self else { return }
+            defer { self.ocrSemaphore.signal() }
+
+            let imageRequestHandler = VNImageRequestHandler(cgImage: documentImage, options: [:])
+            do {
+                try imageRequestHandler.perform([self.textDetectionRequest])
+            } catch {
                 return
             }
-            
-            guard let results = request.results as? [VNTextObservation] else {
-                return
-            }
-            
+            guard let results = self.textDetectionRequest.results as? [VNTextObservation] else { return }
+
             let imageWidth = CGFloat(documentImage.width)
             let imageHeight = CGFloat(documentImage.height)
             let transform = CGAffineTransform.identity.scaledBy(x: imageWidth, y: -imageHeight).translatedBy(x: 0, y: -1)
             let mrzTextRectangles = results.map({ $0.boundingBox.applying(transform) }).filter({ $0.width > (imageWidth * 0.8) })
             let mrzRegionRect = mrzTextRectangles.reduce(into: CGRect.null, { $0 = $0.union($1) })
-            
-            // EDIT: Only process if the region is not too tall (similar to Android's check).
-            guard mrzRegionRect.height <= (imageHeight * 0.4) else {
-                return
-            }
-            
-            if let mrzTextImage = documentImage.cropping(to: mrzRegionRect) {
-                // Perform OCR on the cropped & preprocessed MRZ region.
-                if let mrzResult = self.mrz(from: mrzTextImage) {
-                    self.delegate?.onParse(mrzResult)
-                }
+
+            // Only process if the region is not too tall (mirror Android check).
+            guard mrzRegionRect.height <= (imageHeight * 0.4) else { return }
+
+            if let mrzTextImage = documentImage.cropping(to: mrzRegionRect),
+               let mrzResult = self.mrz(from: mrzTextImage) {
+                DispatchQueue.main.async { self.delegate?.onParse(mrzResult) }
             }
         }
-        
-        try? imageRequestHandler.perform([detectTextRectangles])
     }
 }
 
