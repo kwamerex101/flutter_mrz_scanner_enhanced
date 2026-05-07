@@ -12,6 +12,10 @@
 - [ ] **PERF-02**: The live frame loop drops frames while a previous OCR is in flight on both platforms — no coroutine/dispatch backlog accumulation. Behaviorally: under sustained load the scanner produces a stable processed-frame rate and steady memory, instead of growing latency until OOM.
 - [ ] **PERF-03**: The Android live frame path no longer round-trips YUV → JPEG → Bitmap. Conversion goes directly from the frame's YUV planes to a Bitmap suitable for OCR (or to grayscale directly), eliminating the JPEG encode/decode pair. iOS removes per-frame allocation of `VNDetectTextRectanglesRequest` and `CIContext`.
 
+### OCR Engine Modernization (still-image path only)
+- [ ] **OCR-ENG-01**: On iOS, `MRZScanner.scanImage(bytes)` uses Apple Vision `VNRecognizeTextRequest` (with `recognitionLevel = .accurate`, `usesLanguageCorrection = false`) instead of SwiftyTesseract. The live camera path (`MRZScannerView`) keeps using SwiftyTesseract — only the static path is swapped. The Phase 1 API contract is unchanged (channel name `mrzscanner_static`, method `scanImage`, args `{'bytes': bytes}`, return `MRZFullResult?`).
+- [ ] **OCR-ENG-02**: An executable Android plan (`03-ANDROID-PLAN.md`) is written describing the equivalent swap to MLKit on-device text recognition. The plan must be detailed enough to hand to an executor without further research (file paths, line refs, atomic tasks, acceptance checks). Execution is deferred — only the plan is required for this phase.
+
 ### Out of Scope (this milestone)
 - Auto-rotation of the input image — caller responsible for orientation
 - Perspective correction / dewarping
@@ -28,3 +32,5 @@
 | PERF-01 | Phase 2 |
 | PERF-02 | Phase 2 |
 | PERF-03 | Phase 2 |
+| OCR-ENG-01 | Phase 3 |
+| OCR-ENG-02 | Phase 3 |
