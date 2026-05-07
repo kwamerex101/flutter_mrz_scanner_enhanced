@@ -21,6 +21,7 @@ NSObject<FlutterPluginRegistrar> *_registrar;
 //  factory.controller = registrar.messenger;
 //  FlutterMRZScannerFactory* factory = [[FlutterMRZScannerFactory alloc] init:registrar.messenger];
   [registrar registerViewFactory:factory withId:@"mrzscanner"];
+  [MrzStaticChannel registerWith:registrar.messenger];
 }
 
 + (NSObject<FlutterPluginRegistrar> *)registrar {

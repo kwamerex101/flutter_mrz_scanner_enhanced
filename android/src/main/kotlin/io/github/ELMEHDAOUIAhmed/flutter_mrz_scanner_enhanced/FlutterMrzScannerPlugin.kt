@@ -1,6 +1,8 @@
 package io.github.elmehdaouiahmed.flutter_mrz_scanner_enhanced
 
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import android.view.View
 import androidx.annotation.NonNull
 import io.flutter.embedding.engine.plugins.FlutterPlugin
@@ -18,12 +20,54 @@ import io.fotoapparat.selector.front
 
 class FlutterMrzScannerPlugin : FlutterPlugin {
 
+    private var staticChannel: MethodChannel? = null
+    private var appContext: Context? = null
+
     override fun onAttachedToEngine(flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
-        flutterPluginBinding.applicationContext
-        flutterPluginBinding.platformViewRegistry.registerViewFactory("mrzscanner", MRZScannerFactory(flutterPluginBinding))
+        appContext = flutterPluginBinding.applicationContext
+        flutterPluginBinding.platformViewRegistry.registerViewFactory(
+            "mrzscanner",
+            MRZScannerFactory(flutterPluginBinding)
+        )
+        staticChannel = MethodChannel(flutterPluginBinding.binaryMessenger, "mrzscanner_static").apply {
+            setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "scanImage" -> handleScanImage(call, result)
+                    else -> result.notImplemented()
+                }
+            }
+        }
     }
 
-    override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {}
+    override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+        staticChannel?.setMethodCallHandler(null)
+        staticChannel = null
+        appContext = null
+    }
+
+    private fun handleScanImage(call: MethodCall, result: MethodChannel.Result) {
+        val ctx = appContext
+        if (ctx == null) {
+            result.error("NO_CONTEXT", "Plugin detached", null)
+            return
+        }
+        val bytes = call.argument<ByteArray>("bytes")
+        if (bytes == null) {
+            result.error("BAD_ARGS", "Missing bytes", null)
+            return
+        }
+        val main = Handler(Looper.getMainLooper())
+        Thread {
+            try {
+                val text = MrzOcr.scanImage(ctx, bytes)
+                main.post { result.success(text) }
+            } catch (e: IllegalArgumentException) {
+                main.post { result.error("DECODE_FAILED", e.message, null) }
+            } catch (e: Throwable) {
+                main.post { result.error("SCAN_FAILED", e.message, null) }
+            }
+        }.start()
+    }
 }
 
 class MRZScannerFactory(private val flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) : PlatformViewFactory(StandardMessageCodec.INSTANCE) {
