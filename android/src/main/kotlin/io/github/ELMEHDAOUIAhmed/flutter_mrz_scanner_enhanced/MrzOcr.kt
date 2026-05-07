@@ -10,9 +10,15 @@ import android.graphics.ColorMatrixColorFilter
 import android.graphics.Matrix
 import android.graphics.Paint
 import androidx.exifinterface.media.ExifInterface
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.TextRecognizer
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import com.googlecode.tesseract.android.TessBaseAPI
 import java.io.ByteArrayInputStream
 import java.io.File
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /**
  * Single source of truth for the Tesseract OCR pipeline used by both the live
@@ -29,6 +35,31 @@ object MrzOcr {
 
     @Volatile
     private var trainedDataReady = false
+
+    // ML Kit text recognizer reused for the lifetime of the plugin. MLKit
+    // recommends a single recognizer instance — its native resources are
+    // released via [shutdownMlkit] from FlutterMrzScannerPlugin.onDetachedFromEngine.
+    @Volatile
+    private var mlkitRecognizer: TextRecognizer? = null
+    private val mlkitLock = Any()
+
+    private fun getMlkitRecognizer(): TextRecognizer {
+        mlkitRecognizer?.let { return it }
+        synchronized(mlkitLock) {
+            mlkitRecognizer?.let { return it }
+            val r = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+            mlkitRecognizer = r
+            return r
+        }
+    }
+
+    /** Release the cached MLKit recognizer. Called on plugin detach. */
+    fun shutdownMlkit() {
+        synchronized(mlkitLock) {
+            mlkitRecognizer?.close()
+            mlkitRecognizer = null
+        }
+    }
 
     // NOTE: This singleton API is the static-path cache (app-lifetime).
     // The live camera path (FotoapparatCamera.tessApi) owns its OWN
@@ -87,27 +118,78 @@ object MrzOcr {
     }
 
     /**
-     * Decode bytes (JPEG/PNG/etc.), apply EXIF orientation, preprocess, OCR.
-     * Returns recognized text, or null if Tesseract found nothing.
-     * Throws [IllegalArgumentException] if the bytes cannot be decoded.
+     * Decode bytes (JPEG/PNG/etc.), apply EXIF orientation, run ML Kit
+     * on-device text recognition, filter MRZ-shaped lines, and return them
+     * joined by `\n` (or null when no MRZ-shaped line is found).
+     *
+     * Phase 3b: the static still-image path was swapped from Tesseract to
+     * ML Kit text recognition. The legacy Tesseract helpers
+     * (`acquireSharedBaseApi`, `runTesseractWith`, `preprocess`) are kept
+     * because the live camera path ([FotoapparatCamera]) still uses them.
      */
     fun scanImage(context: Context, bytes: ByteArray): String? {
-        ensureTrainedData(context)
+        return scanImageWithMlkit(context, bytes)
+    }
+
+    /**
+     * Decode bytes (JPEG/PNG/etc.), apply EXIF orientation, run MLKit text
+     * recognition. Returns MRZ-shaped lines joined with `\n`, or null.
+     */
+    private fun scanImageWithMlkit(context: Context, bytes: ByteArray): String? {
         val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
             ?: throw IllegalArgumentException("Unable to decode image bytes")
-        var oriented: Bitmap = decoded
-        var processed: Bitmap? = null
-        try {
-            oriented = applyExif(decoded, bytes)
-            processed = preprocess(oriented)
-            val api = acquireSharedBaseApi(context)
-            val text = synchronized(baseApiLock) { runTesseractWith(api, processed) }
-            return if (text.isNullOrBlank()) null else text
+        val oriented = applyExif(decoded, bytes)
+        return try {
+            // Pre-rotated above, so pass rotationDegrees = 0 (the bitmap is
+            // already in its display orientation).
+            val input = InputImage.fromBitmap(oriented, 0)
+            val recognizer = getMlkitRecognizer()
+            // MLKit's process() returns a Task — bridge to sync via a latch.
+            // FlutterMrzScannerPlugin.handleScanImage already runs us on a
+            // worker thread, so blocking here does not stall the platform thread.
+            val latch = CountDownLatch(1)
+            var resultText: String? = null
+            var failure: Exception? = null
+            recognizer.process(input)
+                .addOnSuccessListener { text ->
+                    resultText = filterMrzLines(text.text)
+                    latch.countDown()
+                }
+                .addOnFailureListener { e ->
+                    failure = e
+                    latch.countDown()
+                }
+            if (!latch.await(15, TimeUnit.SECONDS)) {
+                throw RuntimeException("MLKit text recognition timed out")
+            }
+            failure?.let { throw it }
+            resultText
         } finally {
-            if (processed != null && processed !== oriented) processed.recycle()
             if (oriented !== decoded) oriented.recycle()
             decoded.recycle()
         }
+    }
+
+    /** Filter MLKit's recognized text down to MRZ-shaped lines. */
+    private fun filterMrzLines(raw: String): String? {
+        val mrzLines = raw.split('\n').mapNotNull { line ->
+            val normalized = line
+                .replace(" ", "")
+                .replace("«", "<")
+                .uppercase()
+            // MRZ alphabet is A-Z, 0-9, < — anything else disqualifies.
+            // Shortest valid MRZ line is TD1 at 30 chars; allow a small
+            // tolerance for OCR slop on edge characters.
+            if (normalized.length >= 28 &&
+                normalized.all { it.isLetterOrDigit() || it == '<' } &&
+                normalized.any { it == '<' || it.isDigit() }
+            ) {
+                normalized
+            } else {
+                null
+            }
+        }
+        return if (mrzLines.isEmpty()) null else mrzLines.joinToString("\n")
     }
 
     /** Grayscale + binary threshold (port of FotoapparatCamera.preprocessImage). */
