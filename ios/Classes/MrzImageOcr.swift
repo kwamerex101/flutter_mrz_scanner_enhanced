@@ -12,6 +12,17 @@ enum MrzImageOcrError: Error { case decodeFailed }
 final class MrzImageOcr {
     static let shared = MrzImageOcr()
 
+    // Shared across live + static paths. CIContext is documented thread-safe
+    // by Apple. Replaces a per-call CIContext(options: nil) allocation in
+    // preprocess() (was at MrzImageOcr.swift:87 pre-Phase-2).
+    static let sharedCIContext = CIContext(options: nil)
+
+    // LOCKED — DO NOT change to a non-lazy initializer or rebuild per call.
+    // The whole point of the shared singleton is one-time init for the
+    // lifetime of the app. Live + static paths both share this instance;
+    // serialization is enforced upstream (live: serial frame queue +
+    // serial ocrQueue; static: SwiftFlutterMrzScannerPlugin global queue
+    // + the one-call-at-a-time semantics of FlutterMethodChannel handlers).
     lazy var tesseract: SwiftyTesseract = {
         let bundle = Bundle(url: Bundle(for: MRZScannerView.self)
             .url(forResource: "TraineedDataBundle", withExtension: "bundle")!)!
@@ -84,7 +95,7 @@ final class MrzImageOcr {
             kCIInputContrastKey: 4.0
         ])
 
-        let context = CIContext(options: nil)
+        let context = Self.sharedCIContext
         if let outputCGImage = context.createCGImage(threshold, from: threshold.extent) {
             return UIImage(cgImage: outputCGImage)
         }

@@ -5,6 +5,12 @@ import ImageIO
 /// `MRZScannerView.createMatchingBackingDataWithImage` so both the live capture
 /// path and the static `MrzImageOcr` path share one EXIF-rotation implementation.
 func createMatchingBackingDataWithImage(imageRef: CGImage?, orientation: UIImage.Orientation) -> CGImage? {
+    // Skip the CGContext allocation + draw when no rotation/mirror is
+    // needed. CGImage is immutable, so returning the original ref is safe.
+    if orientation == .up {
+        return imageRef
+    }
+
     var orientedImage: CGImage?
 
     if let imageRef = imageRef {

@@ -404,7 +404,13 @@ extension MRZScannerView: AVCapturePhotoCaptureDelegate {
         let imageHeight = Float(image.height)
         let maxWidth: Float = 720.0
         let maxHeight: Float = 1280.0
-        
+
+        // Skip resize when already within target bounds — avoid an
+        // unnecessary CGContext allocation + per-pixel draw.
+        if imageWidth <= maxWidth && imageHeight <= maxHeight {
+            return image
+        }
+
         // Get ratio (landscape or portrait)
         if imageWidth > imageHeight {
             ratio = maxWidth / imageWidth
