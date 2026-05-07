@@ -1,11 +1,12 @@
 # Roadmap
 
-**2 phases** | **6 requirements** | All v1 requirements covered ✓
+**3 phases** | **8 requirements** | All v1 requirements covered ✓
 
 | # | Phase | Goal | Requirements | Success Criteria |
 |---|-------|------|--------------|------------------|
 | 1 | Image-based MRZ scan | Add `scanImage(bytes)` API on iOS, Android, and Dart, reusing the existing Tesseract pipeline | SCAN-IMG-01, SCAN-IMG-02, SCAN-IMG-03 | 4 |
 | 2 | Scan throughput | Make live + static paths materially faster: cache Tesseract, throttle frames, eliminate YUV→JPEG→Bitmap roundtrip, plus quick wins | PERF-01, PERF-02, PERF-03 | 5 |
+| 3 | Modern OCR engines for `scanImage` | Swap legacy Tesseract for modern neural OCR on the still-image path: iOS uses Apple Vision `VNRecognizeTextRequest`; Android plan written for follow-up MLKit swap | OCR-ENG-01, OCR-ENG-02 | 4 |
 
 ---
 
@@ -37,5 +38,25 @@
 3. Android live path no longer encodes YUV → JPEG just to decode back to a `Bitmap`; conversion is direct.
 4. iOS reuses `VNDetectTextRectanglesRequest` and `CIContext` across frames instead of allocating per call.
 5. No regression in MRZ recognition accuracy or in the static `scanImage` API contract from Phase 1 (unit test still passes; live + static both still parse correctly).
+
+**UI hint:** no
+
+---
+
+## Phase 3: Modern OCR engines for `scanImage`
+
+**Goal:** The bundled `ocrb.traineddata` is a legacy Tesseract 3 model with no LSTM neural net — accuracy on one-shot still images hits a ceiling that the live path papers over by retrying ~30 frames/sec until check digits validate. Swap the still-image OCR path to a modern neural engine on each platform. Live camera path stays on Tesseract (fine for that use case, no app-size or dependency churn).
+
+**Requirements:** OCR-ENG-01, OCR-ENG-02
+
+**Phase 3a (this phase): iOS** — `MRZScanner.scanImage` on iOS uses `VNRecognizeTextRequest` (Apple Vision) instead of SwiftyTesseract. Free, ~0 MB cost, on-device, materially better on real-world camera photos.
+
+**Phase 3b (deliverable: PLAN.md only, not executed yet): Android** — equivalent swap to MLKit on-device text recognition. Plan written and committed; execution deferred until iOS results are validated.
+
+**Success criteria:**
+1. `MRZScanner.scanImage(bytes)` on iOS no longer routes through SwiftyTesseract; it uses `VNRecognizeTextRequest` with `recognitionLevel = .accurate`, `usesLanguageCorrection = false`.
+2. Live camera path (`MRZScannerView`) is unchanged — still uses SwiftyTesseract via the existing delegation point.
+3. Phase 1 unit test (`test/static_channel_test.dart`) still passes — channel name/method/args/return semantics unchanged.
+4. A written `03-ANDROID-PLAN.md` deliverable exists describing the Android MLKit swap as an executable task list (research → tasks → verification).
 
 **UI hint:** no

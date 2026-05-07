@@ -5,7 +5,7 @@ Based on [![Pub Version](https://img.shields.io/pub/v/flutter_mrz_scanner)](http
 **A community-maintained fork** of the original `flutter_mrz_scanner` package with significant improvements to MRZ scanning reliability and camera UX.
 
 ## ✨ Key Enhancements
-- **Image-based scanning** — new `MRZScanner.scanImage(Uint8List bytes)` static API parses MRZ from any image (gallery pick, captured photo, asset, etc.) without mounting the camera widget
+- **Image-based scanning** — new `MRZScanner.scanImage(Uint8List bytes)` static API parses MRZ from any image (gallery pick, captured photo, asset, etc.) without mounting the camera widget. On iOS the still-image path uses Apple Vision (`VNRecognizeTextRequest`) rather than legacy Tesseract for materially better accuracy on real-world camera photos. The live camera path keeps using Tesseract on both platforms.
 - **Improved text recognition accuracy** through advanced image preprocessing
 - **Optimized camera overlay UI** for better user experience
 - **Faster scan throughput**
