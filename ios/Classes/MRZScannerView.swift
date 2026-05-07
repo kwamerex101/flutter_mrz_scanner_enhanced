@@ -24,9 +24,9 @@ public class MRZScannerView: UIView {
     private let ocrQueue = DispatchQueue(label: "mrz_ocr_queue", qos: .userInitiated)
     // Reused across frames; safe because the upstream serial frame queue
     // (video_frames_queue) and this serial ocrQueue together guarantee
-    // non-concurrent perform() calls on this VNRequest. Do NOT share this
-    // instance with the static path — that path uses its own VNRequest in
-    // MrzImageOcr.detectMrzRegion.
+    // non-concurrent perform() calls on this VNRequest. The static path
+    // (MrzImageOcr.scanImage) uses Apple Vision text recognition entirely
+    // separately — see Phase 3 — so there is no shared VNRequest to worry about.
     private lazy var textDetectionRequest: VNDetectTextRectanglesRequest = {
         let r = VNDetectTextRectanglesRequest()
         r.reportCharacterBoxes = false

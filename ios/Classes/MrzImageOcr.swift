@@ -31,8 +31,16 @@ final class MrzImageOcr {
                                engineMode: .tesseractLstmCombined)
     }()
 
-    /// Decode bytes (JPEG/PNG/HEIC), apply EXIF orientation, detect MRZ region
-    /// via Vision, OCR. Returns recognized text or nil.
+    /// Decode bytes (JPEG/PNG/HEIC), apply EXIF orientation, OCR with
+    /// Apple Vision's neural text recognizer. Returns recognized MRZ text
+    /// (one MRZ line per `\n`-separated entry) or nil.
+    ///
+    /// NOTE: this path used to call SwiftyTesseract via `performOcr(on:)`.
+    /// As of Phase 3 the static still-image path uses Vision instead — the
+    /// bundled `ocrb.traineddata` is a legacy Tesseract 3 model with no LSTM
+    /// and hits an accuracy ceiling on one-shot images. The live camera path
+    /// (MRZScannerView.captureOutput) keeps using Tesseract via
+    /// `performOcr(on:)`; that helper is intentionally NOT modified.
     func scanImage(data: Data) throws -> String? {
         guard let src = CGImageSourceCreateWithData(data as CFData, nil) else {
             throw MrzImageOcrError.decodeFailed
@@ -44,9 +52,57 @@ final class MrzImageOcr {
 
         return autoreleasepool { () -> String? in
             let oriented = Self.applyExif(raw, source: src)
-            let mrzCrop = detectMrzRegion(in: oriented) ?? oriented
-            return performOcr(on: mrzCrop)
+            return Self.recognizeMrzLines(in: oriented)
         }
+    }
+
+    /// Run Vision text recognition on the full image and stitch MRZ-shaped
+    /// candidate lines together (top-to-bottom). Returns nil when no
+    /// MRZ-shaped line is found.
+    ///
+    /// Vision detects + recognizes in one pass — no separate
+    /// `VNDetectTextRectanglesRequest` step needed (that helper is left
+    /// in place for the live Tesseract path).
+    private static func recognizeMrzLines(in cgImage: CGImage) -> String? {
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        // Critical for MRZ — language correction would mangle passport
+        // numbers (e.g. swap 0/O, 1/I) since MRZ is not natural language.
+        request.usesLanguageCorrection = false
+        request.recognitionLanguages = ["en-US"]
+        // Bias toward MRZ filler. Harmless if not present in the image.
+        request.customWords = ["<<", "<<<"]
+
+        do { try handler.perform([request]) } catch { return nil }
+        guard let observations = request.results as? [VNRecognizedTextObservation],
+              !observations.isEmpty else { return nil }
+
+        // Each observation = one detected line. Sort top-to-bottom in image
+        // coordinates (Vision uses bottom-left origin, so larger minY = higher).
+        let sorted = observations.sorted { $0.boundingBox.minY > $1.boundingBox.minY }
+
+        let mrzLines: [String] = sorted.compactMap { obs in
+            guard let raw = obs.topCandidates(1).first?.string else { return nil }
+            // Normalize like the Dart side does (`<` aliases) before
+            // length-checking so quirky recognizer outputs (`«`, spaces) still
+            // pass the gate.
+            let normalized = raw
+                .replacingOccurrences(of: " ", with: "")
+                .replacingOccurrences(of: "«", with: "<")
+                .uppercased()
+            // MRZ alphabet is A-Z, 0-9, < — anything else disqualifies.
+            // Shortest valid MRZ line is TD1 at 30 chars; allow a small
+            // tolerance for OCR slop on edge characters.
+            guard normalized.count >= 28,
+                  normalized.allSatisfy({ ($0.isLetter && $0.isASCII) || $0.isNumber || $0 == "<" }) else {
+                return nil
+            }
+            return normalized
+        }
+
+        guard !mrzLines.isEmpty else { return nil }
+        return mrzLines.joined(separator: "\n")
     }
 
     private static func applyExif(_ cgImage: CGImage, source: CGImageSource) -> CGImage {
@@ -59,21 +115,8 @@ final class MrzImageOcr {
         return applyExifOrientation(to: cgImage, exifOrientation: exif)
     }
 
-    private func detectMrzRegion(in cgImage: CGImage) -> CGImage? {
-        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
-        let req = VNDetectTextRectanglesRequest()
-        try? handler.perform([req])
-        guard let results = req.results as? [VNTextObservation] else { return nil }
-        let w = CGFloat(cgImage.width)
-        let h = CGFloat(cgImage.height)
-        let t = CGAffineTransform.identity.scaledBy(x: w, y: -h).translatedBy(x: 0, y: -1)
-        let rects = results.map { $0.boundingBox.applying(t) }.filter { $0.width > w * 0.8 }
-        let union = rects.reduce(into: CGRect.null) { $0 = $0.union($1) }
-        guard !union.isNull, union.height <= h * 0.4 else { return nil }
-        return cgImage.cropping(to: union)
-    }
-
-    /// Preprocess + OCR. Used by both the live `mrz(from:)` path and the static path.
+    /// Preprocess + OCR. Used by the live `mrz(from:)` path only —
+    /// the static `scanImage(data:)` path uses Vision (see Phase 3).
     func performOcr(on cgImage: CGImage) -> String? {
         let originalImage = UIImage(cgImage: cgImage)
         let preprocessedImage = preprocess(originalImage)
