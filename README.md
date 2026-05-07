@@ -5,7 +5,7 @@ Based on [![Pub Version](https://img.shields.io/pub/v/flutter_mrz_scanner)](http
 **A community-maintained fork** of the original `flutter_mrz_scanner` package with significant improvements to MRZ scanning reliability and camera UX.
 
 ## ✨ Key Enhancements
-- **Image-based scanning** — new `MRZScanner.scanImage(Uint8List bytes)` static API parses MRZ from any image (gallery pick, captured photo, asset, etc.) without mounting the camera widget. On iOS the still-image path uses Apple Vision (`VNRecognizeTextRequest`) rather than legacy Tesseract for materially better accuracy on real-world camera photos. The live camera path keeps using Tesseract on both platforms.
+- **Image-based scanning** — new `MRZScanner.scanImage(Uint8List bytes)` static API parses MRZ from any image (gallery pick, captured photo, asset, etc.) without mounting the camera widget. The still-image path uses modern neural OCR for materially better accuracy on real-world camera photos: **Apple Vision (`VNRecognizeTextRequest`) on iOS** and **Google ML Kit text recognition on Android**. The live camera path keeps using Tesseract on both platforms.
 - **Improved text recognition accuracy** through advanced image preprocessing
 - **Optimized camera overlay UI** for better user experience
 - **Faster scan throughput**
@@ -122,7 +122,8 @@ if (result != null) {
 Behavior:
 - Returns `MRZFullResult?` — `null` when OCR finds nothing or the text isn't a valid MRZ.
 - Throws `PlatformException` only on hard native failures (e.g. undecodable bytes).
-- Reuses the same Tesseract pipeline (`ocrb` trained data, charset whitelist, preprocessing) as the live path, so accuracy matches.
+- Modern neural OCR per platform — **Apple Vision** on iOS, **Google ML Kit text recognition** on Android. Both run on-device, no network, no model download. The legacy `ocrb`-trained Tesseract pipeline is no longer used for still-image scans (it remains in place for live camera scanning).
+- MRZ-shaped lines are filtered + ordered structurally (TD3 line 1 vs line 2 by content, not just spatial position) before being handed to `mrz_parser` — so passport photos parse correctly regardless of EXIF rotation or where Vision/ML Kit happen to emit observations from.
 - EXIF-normalized on both platforms — pass raw bytes from `image_picker`/files/assets and the library handles orientation.
 - Caller passes raw bytes only; no crop rect, no file path, no asset key.
 
