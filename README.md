@@ -5,9 +5,15 @@ Based on [![Pub Version](https://img.shields.io/pub/v/flutter_mrz_scanner)](http
 **A community-maintained fork** of the original `flutter_mrz_scanner` package with significant improvements to MRZ scanning reliability and camera UX.
 
 ## ✨ Key Enhancements
+- **Image-based scanning** — new `MRZScanner.scanImage(Uint8List bytes)` static API parses MRZ from any image (gallery pick, captured photo, asset, etc.) without mounting the camera widget
 - **Improved text recognition accuracy** through advanced image preprocessing
 - **Optimized camera overlay UI** for better user experience
-- Enhanced image processing pipelines
+- **Faster scan throughput**
+  - `TessBaseAPI` / `SwiftyTesseract` cached per scanning session (no more per-frame init)
+  - Live frame loop drops frames while OCR is in flight (no backlog under load)
+  - Android live path goes directly from NV21 Y-plane to a thresholded `Bitmap` — JPEG round-trip removed
+  - iOS reuses `VNDetectTextRectanglesRequest` and `CIContext` across frames; OCR runs off the sample-buffer queue
+- **EXIF orientation handling** for both `takePhoto()` and `scanImage()` — portrait gallery photos OCR upright
 - Modernized dependencies and null-safety support
 - Improved error handling and validation
 - Better platform compatibility
@@ -54,10 +60,17 @@ dependencies:
 ```
 ### For iOS
 Set iOS deployment target to 12.
-The plugin uses the device camera, so do not forget to provide the `NSCameraUsageDescription`. You may specify it in `Info.plist` like that:
+
+The plugin uses the device camera, so do not forget to provide the `NSCameraUsageDescription` in `Info.plist`:
 ```xml
     <key>NSCameraUsageDescription</key>
     <string>SCANNING MRZ REQUIRE CAMERA PERMISSIONS</string>
+```
+
+If you also use `MRZScanner.scanImage()` with a gallery picker (e.g. `image_picker`), add `NSPhotoLibraryUsageDescription`:
+```xml
+    <key>NSPhotoLibraryUsageDescription</key>
+    <string>Pick a passport photo to scan its MRZ.</string>
 ```
 
 ### For Android
@@ -65,18 +78,55 @@ Add
 ```
 <uses-permission android:name="android.permission.CAMERA" />
 ```
-to `AndroidManifest.xml`
+to `AndroidManifest.xml`. Camera permission is only required for the live scanner widget — `scanImage()` works without it.
 
-### Use the widget
-Use `MRZScanner` widget:
+### Live camera scanning — `MRZScanner` widget
+
+Use the `MRZScanner` widget for real-time camera-based scanning:
+
 ```dart
 MRZScanner(
   withOverlay: true, // Mandatory for proper document cropping
-  onControllerCreated: (controller) =>
-    onControllerCreated(controller),
-  )
+  onControllerCreated: (controller) {
+    controller.onParsed = (mrz) {
+      // mrz.mrzResult — parsed fields (name, doc number, DOB, expiry, …)
+      // mrz.mrz       — raw MRZ string the OCR produced
+    };
+    controller.onParsingFailed = () { /* keep scanning */ };
+    controller.onError = (msg) { /* surface to UI */ };
+  },
+)
 ```
-Refer to `example` project for the complete app sample.
+
+The controller also exposes `flashlightOn()`, `flashlightOff()`, `startPreview()`, `stopPreview()`, and `takePhoto({bool crop = true})`.
+
+### Image-based scanning — `MRZScanner.scanImage`
+
+Scan MRZ from any image (gallery pick, file, asset, captured photo) **without mounting the widget**:
+
+```dart
+import 'dart:typed_data';
+import 'package:flutter_mrz_scanner_enhanced/flutter_mrz_scanner_enhanced.dart';
+
+final Uint8List bytes = await pickedFile.readAsBytes(); // e.g. from image_picker
+final result = await MRZScanner.scanImage(bytes);
+
+if (result != null) {
+  print(result.mrzResult.givenNames);
+  print(result.mrzResult.documentNumber);
+} else {
+  // OCR found no MRZ, or text wasn't a valid MRZ
+}
+```
+
+Behavior:
+- Returns `MRZFullResult?` — `null` when OCR finds nothing or the text isn't a valid MRZ.
+- Throws `PlatformException` only on hard native failures (e.g. undecodable bytes).
+- Reuses the same Tesseract pipeline (`ocrb` trained data, charset whitelist, preprocessing) as the live path, so accuracy matches.
+- EXIF-normalized on both platforms — pass raw bytes from `image_picker`/files/assets and the library handles orientation.
+- Caller passes raw bytes only; no crop rect, no file path, no asset key.
+
+Refer to the `example/` project for a complete app demonstrating both paths (live camera + image picker).
 
 ## Acknowledgements
 * [Anna Domashych](https://github.com/foxanna) for helping with [mrz_parser](https://github.com/olexale/mrz_parser) implementation in Dart
