@@ -92,6 +92,10 @@ class MRZScannerView internal constructor(context: Context, messenger: BinaryMes
 
     override fun dispose() {
         cameraView.fotoapparat.stop()
+        // Cancels the SupervisorJob AND recycles the cached TessBaseAPI.
+        // Without this, every PlatformView teardown leaked the coroutine
+        // job (pre-existing) and now also a native TessBaseAPI handle.
+        cameraView.dispose()
     }
 
     override fun onMethodCall(@NonNull call: MethodCall, @NonNull result: MethodChannel.Result) {

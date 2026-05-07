@@ -32,6 +32,12 @@ class FotoapparatCamera constructor(
     private val job = SupervisorJob()
     private val scope = CoroutineScope(Dispatchers.IO + job)
 
+    // Per-session TessBaseAPI for the live camera frame path. Lazily inited
+    // on first OCR call, recycled in [dispose]. SEPARATE from the static
+    // path's MrzOcr.acquireSharedBaseApi(...) — see CONTEXT.md.
+    private var tessApi: TessBaseAPI? = null
+    private val tessLock = Any()
+
     val cameraView = CameraView(context)
 
     val configuration = CameraConfiguration(
@@ -212,9 +218,35 @@ class FotoapparatCamera constructor(
         return MrzOcr.preprocess(bitmap)
     }
 
+    private fun ensureTessApi(): TessBaseAPI {
+        tessApi?.let { return it }
+        synchronized(tessLock) {
+            tessApi?.let { return it }
+            MrzOcr.ensureTrainedData(context)
+            val api = TessBaseAPI()
+            api.init(context.cacheDir.absolutePath, "ocrb")
+            api.setVariable(
+                "tessedit_char_whitelist",
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<"
+            )
+            api.pageSegMode = TessBaseAPI.PageSegMode.PSM_SINGLE_BLOCK
+            tessApi = api
+            return api
+        }
+    }
+
+    // LIVE-PATH EXIF NOTE:
+    // Live frames are routed through MrzOcr.runTesseractWith, NOT
+    // MrzOcr.scanImage. Therefore MrzOcr.applyExif() is NEVER called on
+    // live frames — `frame.rotation` (handled in nv21ToBinaryBitmap) is the
+    // only orientation source the live path needs. Static-path scanImage
+    // continues to apply EXIF for image_picker / takePhoto inputs.
+    // Do not "factor out" by routing live frames through scanImage(bytes).
     // Run OCR using Tesseract on the provided bitmap.
     private fun scanMRZ(bitmap: Bitmap): String {
-        return MrzOcr.runTesseract(context, bitmap) ?: ""
+        val api = ensureTessApi()
+        // Live frame queue is serial; no external lock needed.
+        return MrzOcr.runTesseractWith(api, bitmap) ?: ""
     }
 
     private fun extractMRZ(input: String): String {
@@ -319,7 +351,15 @@ class FotoapparatCamera constructor(
     }
 
     fun dispose() {
-    job.cancel()
+        job.cancel()
+        synchronized(tessLock) {
+            try { tessApi?.recycle() } catch (_: Throwable) {
+                try { tessApi?.end() } catch (_: Throwable) {
+                    try { tessApi?.stop() } catch (_: Throwable) {}
+                }
+            }
+            tessApi = null
+        }
     }
 }
 

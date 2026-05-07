@@ -30,6 +30,46 @@ object MrzOcr {
     @Volatile
     private var trainedDataReady = false
 
+    // NOTE: This singleton API is the static-path cache (app-lifetime).
+    // The live camera path (FotoapparatCamera.tessApi) owns its OWN
+    // TessBaseAPI keyed to the camera session. Do NOT collapse them — see
+    // .planning/phases/02-scan-throughput/02-CONTEXT.md.
+    @Volatile
+    private var sharedBaseApi: TessBaseAPI? = null
+    internal val baseApiLock = Any()
+
+    /**
+     * Lazily acquire the process-wide static-path TessBaseAPI. Initialized
+     * on first call, never recycled (app-lifetime cache). Concurrent callers
+     * (FlutterMrzScannerPlugin.handleScanImage spawns Thread { } per call)
+     * must serialize setImage/utF8Text on [baseApiLock].
+     */
+    internal fun acquireSharedBaseApi(context: Context): TessBaseAPI {
+        sharedBaseApi?.let { return it }
+        ensureTrainedData(context)
+        synchronized(baseApiLock) {
+            sharedBaseApi?.let { return it }
+            val api = TessBaseAPI()
+            api.init(context.cacheDir.absolutePath, TESS_LANG)
+            api.setVariable("tessedit_char_whitelist", TESS_WHITELIST)
+            api.pageSegMode = PAGE_SEG_MODE
+            sharedBaseApi = api
+            return api
+        }
+    }
+
+    /**
+     * Reuse-friendly OCR: caller owns [api]; we only setImage + read text.
+     * Caller must serialize concurrent calls on [api] externally:
+     *   - live path is single-frame-thread (Fotoapparat frame queue),
+     *   - static path uses [baseApiLock].
+     */
+    internal fun runTesseractWith(api: TessBaseAPI, bitmap: Bitmap): String? {
+        api.setImage(bitmap)
+        val text = api.utF8Text
+        return if (text.isNullOrBlank()) null else text
+    }
+
     /** Idempotent + thread-safe trained-data extraction. */
     fun ensureTrainedData(context: Context) {
         if (trainedDataReady) return
@@ -60,7 +100,8 @@ object MrzOcr {
         try {
             oriented = applyExif(decoded, bytes)
             processed = preprocess(oriented)
-            val text = runTesseract(context, processed)
+            val api = acquireSharedBaseApi(context)
+            val text = synchronized(baseApiLock) { runTesseractWith(api, processed) }
             return if (text.isNullOrBlank()) null else text
         } finally {
             if (processed != null && processed !== oriented) processed.recycle()
@@ -98,6 +139,10 @@ object MrzOcr {
      * Releases native resources via `recycle()` to avoid leaks for the static
      * one-shot path (live path keeps its existing `stop()` semantics).
      */
+    @Deprecated(
+        message = "Allocates and recycles a TessBaseAPI per call. Use acquireSharedBaseApi(context) + runTesseractWith(api, bitmap) (with appropriate external serialization) instead.",
+        replaceWith = ReplaceWith("acquireSharedBaseApi(context).let { api -> synchronized(baseApiLock) { runTesseractWith(api, bitmap) } }")
+    )
     internal fun runTesseract(context: Context, bitmap: Bitmap): String? {
         val baseApi = TessBaseAPI()
         return try {
