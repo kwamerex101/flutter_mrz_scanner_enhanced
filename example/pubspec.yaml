@@ -9,6 +9,7 @@ dependencies:
   flutter:
     sdk: flutter
   permission_handler: ^11.4.0
+  image_picker: ^1.0.0
 
 dev_dependencies:
   flutter_mrz_scanner_enhanced:
