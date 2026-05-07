@@ -237,8 +237,9 @@ object MrzOcr {
             try {
                 baseApi.recycle()
             } catch (_: Throwable) {
-                // recycle() may not be available on every binding; fall back to end()/stop().
-                try { baseApi.end() } catch (_: Throwable) { try { baseApi.stop() } catch (_: Throwable) {} }
+                // tesseract4android exposes recycle() and stop(); end() is from
+                // the older tess-two binding and is not available here.
+                try { baseApi.stop() } catch (_: Throwable) {}
             }
         }
     }

@@ -433,9 +433,9 @@ class FotoapparatCamera constructor(
         job.cancel()
         synchronized(tessLock) {
             try { tessApi?.recycle() } catch (_: Throwable) {
-                try { tessApi?.end() } catch (_: Throwable) {
-                    try { tessApi?.stop() } catch (_: Throwable) {}
-                }
+                // tesseract4android exposes recycle() and stop(); end() is from
+                // the older tess-two binding and is not available here.
+                try { tessApi?.stop() } catch (_: Throwable) {}
             }
             tessApi = null
         }
