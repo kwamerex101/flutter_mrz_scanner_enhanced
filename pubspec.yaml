@@ -12,6 +12,10 @@ dependencies:
     sdk: flutter
   mrz_parser: ^2.0.1
 
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
 flutter:
   plugin:
     platforms:
