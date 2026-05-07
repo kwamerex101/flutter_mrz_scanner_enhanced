@@ -188,6 +188,9 @@ object MrzOcr {
      *       small slack for edge OCR slop) and contains at least one `<` or
      *       digit. Plain prose rarely satisfies that — `mrz_parser` validates
      *       check digits downstream, so a slightly-loose filter is safe.
+     *    4. Repair filler regions — MLKit frequently misreads the `<` filler
+     *       characters in MRZ as letters (`K`, `C`, `E`, etc.), which breaks
+     *       check digits. See [repairMrzFiller].
      */
     private fun filterMrzLines(raw: String): String? {
         val mrzLines = raw.split('\n').mapNotNull { line ->
@@ -212,9 +215,47 @@ object MrzOcr {
                 "cand raw=\"$line\" norm=\"$normalized\" stripped=\"$stripped\" " +
                         "len=${stripped.length} hasMarker=$hasMrzMarker"
             )
-            if (stripped.length >= 28 && hasMrzMarker) stripped else null
+            if (stripped.length >= 28 && hasMrzMarker) {
+                val repaired = repairMrzFiller(stripped)
+                if (repaired != stripped) {
+                    android.util.Log.d(TAG, "repaired filler: \"$stripped\" -> \"$repaired\"")
+                }
+                repaired
+            } else {
+                null
+            }
         }
         return if (mrzLines.isEmpty()) null else mrzLines.joinToString("\n")
+    }
+
+    /**
+     * Replace stray letters in the MRZ filler region with `<`.
+     *
+     * MLKit (and to a lesser extent every neural OCR) misreads the angle-
+     * bracket filler `<` as letters like `K`, `C`, `E`, `c`, `e`, `k` on
+     * real-world passport photos. Those false letters break the check
+     * digits in `mrz_parser` even when every other character is correct.
+     *
+     * The filler region is identified by the start of the first run of
+     * three or more consecutive `<` characters. Everything from that point
+     * to the end of the line is treated as filler — non-`<` non-digit
+     * characters there are replaced with `<`.
+     *
+     * Digits are preserved because the final composite check digit at the
+     * end of TD3 line 2 sits inside the filler region. Letters before the
+     * first `<<<+` run are left alone because that's where doc type,
+     * country, name, dates, and sex live.
+     */
+    private fun repairMrzFiller(line: String): String {
+        val match = Regex("<{3,}").find(line) ?: return line
+        val fillerStart = match.range.first
+        val chars = line.toCharArray()
+        for (i in fillerStart until chars.size) {
+            val c = chars[i]
+            if (c == '<' || c.isDigit()) continue
+            chars[i] = '<'
+        }
+        return String(chars)
     }
 
     /** Grayscale + binary threshold (port of FotoapparatCamera.preprocessImage). */
