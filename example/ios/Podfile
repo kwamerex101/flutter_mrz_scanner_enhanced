@@ -1,5 +1,5 @@
 # Uncomment this line to define a global platform for your project
-platform :ios, '12.0'
+platform :ios, '13.0'
 
 # CocoaPods analytics sends network stats synchronously affecting flutter build latency.
 ENV['COCOAPODS_DISABLE_STATS'] = 'true'
@@ -43,6 +43,12 @@ post_install do |installer|
         '$(inherited)',
         'PERMISSION_CAMERA=1',
       ]
+
+      # SwiftyTesseract 3.1.3 ships an Intel-only iOS simulator slice (no ios-arm64-simulator).
+      # On Apple Silicon Macs we therefore exclude arm64 from the iphonesimulator build so the
+      # example app links against the available x86_64 slice via Rosetta. Physical-device builds
+      # (iphoneos) are untouched and continue to use the native arm64 slice.
+      config.build_settings['EXCLUDED_ARCHS[sdk=iphonesimulator*]'] = 'arm64'
     end
   end
 end
