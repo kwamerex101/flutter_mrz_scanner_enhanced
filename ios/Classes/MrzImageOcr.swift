@@ -24,8 +24,15 @@ final class MrzImageOcr {
     // serial ocrQueue; static: SwiftFlutterMrzScannerPlugin global queue
     // + the one-call-at-a-time semantics of FlutterMethodChannel handlers).
     lazy var tesseract: SwiftyTesseract = {
-        let bundle = Bundle(url: Bundle(for: MRZScannerView.self)
-            .url(forResource: "TraineedDataBundle", withExtension: "bundle")!)!
+        // SPM generates Bundle.module for the package's resources; CocoaPods
+        // embeds the bundle inside the class's framework bundle instead.
+        #if SWIFT_PACKAGE
+        let bundleURL = Bundle.module.url(forResource: "TraineedDataBundle", withExtension: "bundle")!
+        #else
+        let bundleURL = Bundle(for: MRZScannerView.self)
+            .url(forResource: "TraineedDataBundle", withExtension: "bundle")!
+        #endif
+        let bundle = Bundle(url: bundleURL)!
         return SwiftyTesseract(language: .custom("ocrb"),
                                bundle: bundle,
                                engineMode: .tesseractLstmCombined)
