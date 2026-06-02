@@ -7,6 +7,19 @@
     unavailable/normal.
   - Reduces upside-down passport/document images on manufacturer-specific
     Android camera implementations.
+- 🤖 Android: NV21 portrait-frame rotation index out-of-bounds fix
+  (live OCR no longer crashes on certain devices).
+- 🤖 Android: drop unresolved `TessBaseAPI.end()` call — not exposed by the
+  tesseract4android binding.
+- 🍏 iOS `scanImage` now uses Apple Vision (`VNRecognizeTextRequest`)
+  instead of SwiftyTesseract — materially better OCR on real-world photos.
+- 🤖 Android `scanImage` now uses ML Kit Text Recognition (latin model)
+  with structural line sorting, in place of legacy Tesseract on still images.
+- 🖥️ iOS build: works on Apple Silicon (M-series) Mac simulators via Rosetta
+  fallback (SwiftyTesseract 3.1.3 still ships only an Intel iOS-simulator
+  slice). Plugin podspec deployment target bumped to iOS 13.0 to match the
+  Flutter 3.41+ floor; obsolete `EXCLUDED_ARCHS=i386` removed; orphan
+  `ios/flutter_mrz_scanner.podspec` deleted.
 
 # 3.1.3
 
