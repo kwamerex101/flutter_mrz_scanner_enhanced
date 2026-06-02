@@ -41,6 +41,16 @@
 
 **UI hint:** no
 
+### Phase 4: iOS arm64 simulator support
+
+**Goal:** [To be planned]
+**Requirements**: TBD
+**Depends on:** Phase 3
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (run /gsd-plan-phase 4 to break down)
+
 ---
 
 ## Phase 3: Modern OCR engines for `scanImage`

@@ -22,7 +22,7 @@ flutter analyze
 flutter pub publish --dry-run
 ```
 
-iOS deployment target is **12.0**. There is no automated test suite in this package; verify by running the example app against a real document.
+iOS deployment target is **13.0** (matches the Flutter 3.41+ floor). There is no automated test suite in this package; verify by running the example app against a real document.
 
 ## Architecture
 

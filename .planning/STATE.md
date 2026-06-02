@@ -14,3 +14,8 @@ Phase 1: Image-based MRZ scan
 
 ## Next Action
 Run `/gsd-discuss-phase 1` to research the existing camera/OCR pipeline and clarify the integration approach before planning.
+
+## Accumulated Context
+
+### Roadmap Evolution
+- Phase 4 added: iOS arm64 simulator support
