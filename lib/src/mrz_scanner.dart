@@ -94,6 +94,33 @@ class MRZController {
   void Function(String text)? onError;
   void Function()? onParsingFailed;
 
+  /// Watchdog for the "scanning but never finds an MRZ" hang: if neither a
+  /// successful parse ([onParsed]) nor a native [onError] arrives within the
+  /// timeout passed to [startPreview], [onError] is fired once so the UI can
+  /// surface a retry/fallback instead of sitting on "Scanning…" forever.
+  /// Note: [onParsingFailed] fires on every non-MRZ frame and deliberately
+  /// does NOT reset this timer — the watchdog measures wall-clock time, not
+  /// per-frame parse attempts.
+  Timer? _watchdog;
+
+  void _startWatchdog(Duration timeout) {
+    _watchdog?.cancel();
+    if (timeout <= Duration.zero) {
+      return; // opt-out: no watchdog
+    }
+    _watchdog = Timer(timeout, () {
+      _watchdog = null;
+      onError?.call(
+        'No MRZ detected within ${timeout.inSeconds}s. Scan timed out.',
+      );
+    });
+  }
+
+  void _cancelWatchdog() {
+    _watchdog?.cancel();
+    _watchdog = null;
+  }
+
   void flashlightOn() {
     _channel.invokeMethod<void>('flashlightOn');
   }
@@ -115,6 +142,7 @@ class MRZController {
   Future<void> _platformCallHandler(MethodCall call) {
     switch (call.method) {
       case 'onError':
+        _cancelWatchdog();
         onError?.call(call.arguments);
         debugPrint('Error occurred: ${call.arguments}');
         break;
@@ -128,6 +156,9 @@ class MRZController {
           if (lines.isNotEmpty) {
             final result = MRZParser.tryParse(lines);
             if (result != null) {
+              // Terminal success — stop the no-result watchdog before
+              // handing the result to the consumer.
+              _cancelWatchdog();
               onParsed!(MRZFullResult(mrz: filePath, mrzResult: result));
               debugPrint('Parsing successful');
             } else {
@@ -144,10 +175,30 @@ class MRZController {
     return Future.value();
   }
 
-  void startPreview({bool isFrontCam = false}) =>
-      _channel.invokeMethod<void>('start', {'isFrontCam': isFrontCam});
+  /// Starts the live camera preview.
+  ///
+  /// [scanTimeout] arms a watchdog (see [_watchdog]); if no MRZ is read within
+  /// it, [onError] fires once. Defaults to 25s — long enough for slow scans
+  /// (poor light, cold OCR start, repositioning), short enough to unblock a
+  /// stuck user. Pass [Duration.zero] to disable the watchdog entirely.
+  void startPreview({
+    bool isFrontCam = false,
+    Duration scanTimeout = const Duration(seconds: 25),
+  }) {
+    _channel.invokeMethod<void>('start', {'isFrontCam': isFrontCam});
+    _startWatchdog(scanTimeout);
+  }
 
-  void stopPreview() => _channel.invokeMethod<void>('stop');
+  void stopPreview() {
+    _cancelWatchdog();
+    _channel.invokeMethod<void>('stop');
+  }
+
+  /// Releases the watchdog timer. Call from the host widget's `dispose()` so a
+  /// pending timer cannot fire [onError] after the consumer is gone.
+  void dispose() {
+    _cancelWatchdog();
+  }
 }
 
 class MRZFullResult {

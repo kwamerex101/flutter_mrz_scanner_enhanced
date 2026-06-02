@@ -42,6 +42,19 @@ class FotoapparatCamera constructor(
     // bitmap allocation, no coroutine launch.
     private val ocrInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
 
+    // Surfaces a one-shot `onError` to Flutter after a persistent run of
+    // preprocessing failures, so a systematically-broken frame path reports
+    // an error instead of silently dropping every frame forever. Reset per
+    // scan session via [resetErrorState] (wired to the "start" method call).
+    private val preprocessFailureLatch = PreprocessingFailureLatch()
+
+    // Set true in [dispose] before the job is cancelled. Guards every
+    // messenger.invokeMethod call so we never touch the channel after the
+    // Flutter engine/view has detached (mainExecutor/coroutine callbacks can
+    // outlive the view by a frame).
+    @Volatile
+    private var isDisposed = false
+
     val cameraView = CameraView(context)
 
     val configuration = CameraConfiguration(
@@ -211,15 +224,34 @@ class FotoapparatCamera constructor(
                 "Dropping frame after preprocessing error: ${t.message}",
                 t
             )
+            // Surface a one-shot error if preprocessing keeps failing. Only
+            // t.message is sent (frame-geometry text, no MRZ/PII); never the
+            // full exception chain. Dispatched on the main thread — invokeMethod
+            // off the frame-callback thread is illegal. recordFailure() returns
+            // true exactly once, so this fires at most once per session.
+            if (preprocessFailureLatch.recordFailure()) {
+                mainExecutor.execute {
+                    if (!isDisposed) {
+                        messenger.invokeMethod(
+                            "onError",
+                            "Camera frame preprocessing failed repeatedly: ${t.message}"
+                        )
+                    }
+                }
+            }
             ocrInFlight.set(false)
             return
         }
+        // Preprocessing succeeded this frame — clear the consecutive-failure run.
+        preprocessFailureLatch.recordSuccess()
         scope.launch {
             try {
                 val mrzText = scanMRZ(processedBitmap)
                 val fixedMrz = extractMRZ(mrzText)
                 withContext(Dispatchers.Main) {
-                    messenger.invokeMethod("onParsed", fixedMrz)
+                    if (!isDisposed) {
+                        messenger.invokeMethod("onParsed", fixedMrz)
+                    }
                 }
             } finally {
                 // Recycle the per-frame bitmap (Tesseract.setImage copies
@@ -446,7 +478,19 @@ class FotoapparatCamera constructor(
         )
     }
 
+    /**
+     * Re-arm the persistent-failure detector for a new scan session. Wired to
+     * the "start" method call so a user retry on the SAME (reused) camera
+     * instance does not stay latched and silently hang again.
+     */
+    fun resetErrorState() {
+        preprocessFailureLatch.reset()
+    }
+
     fun dispose() {
+        // Set before cancelling so no in-flight main-thread/coroutine callback
+        // calls invokeMethod on a detached channel.
+        isDisposed = true
         job.cancel()
         synchronized(tessLock) {
             try { tessApi?.recycle() } catch (_: Throwable) {
