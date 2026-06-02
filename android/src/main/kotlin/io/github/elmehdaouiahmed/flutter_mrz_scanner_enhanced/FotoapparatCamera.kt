@@ -253,6 +253,15 @@ class FotoapparatCamera constructor(
                         messenger.invokeMethod("onParsed", fixedMrz)
                     }
                 }
+            } catch (t: Throwable) {
+                // OCR-stage failure (e.g. Tesseract/JNI). Without this catch the
+                // exception would hit the coroutine's uncaught handler and be
+                // invisible. Log only (the throwable, not OCR text — no PII);
+                // the Dart watchdog is the user-facing backstop if systematic.
+                // Deliberately NOT routed through preprocessFailureLatch: the
+                // success path calls recordSuccess() before this coroutine runs,
+                // so a shared counter could never accumulate OCR failures.
+                Log.w("FotoapparatCamera", "OCR processing failed on frame", t)
             } finally {
                 // Recycle the per-frame bitmap (Tesseract.setImage copies
                 // pixels into Pix; we own the Bitmap from here).
@@ -488,6 +497,9 @@ class FotoapparatCamera constructor(
     }
 
     fun dispose() {
+        // Terminal: a disposed FotoapparatCamera is never reused — Flutter
+        // creates a fresh PlatformView (and thus a fresh instance) on the next
+        // scan, so isDisposed is intentionally not cleared by resetErrorState.
         // Set before cancelling so no in-flight main-thread/coroutine callback
         // calls invokeMethod on a detached channel.
         isDisposed = true

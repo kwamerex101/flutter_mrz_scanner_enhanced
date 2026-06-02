@@ -43,10 +43,6 @@ android {
         test.java.srcDirs += 'src/test/kotlin'
     }
 
-    testOptions {
-        unitTests.returnDefaultValues = true
-    }
-
     defaultConfig {
         minSdkVersion 21
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"

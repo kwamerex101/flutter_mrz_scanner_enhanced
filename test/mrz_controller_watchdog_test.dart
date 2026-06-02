@@ -164,4 +164,29 @@ void main() {
       expect(errorCalls, 0);
     });
   });
+
+  test('startPreview twice cancels the first watchdog (fires once)', () {
+    fakeAsync((async) {
+      final controller = makeController();
+      var errorCalls = 0;
+      controller.onError = (_) => errorCalls++;
+
+      controller.startPreview(scanTimeout: const Duration(seconds: 25));
+      controller.startPreview(scanTimeout: const Duration(seconds: 10));
+      async.elapse(const Duration(seconds: 11)); // past 2nd, before 1st(25s)
+      expect(errorCalls, 1);
+      async.elapse(const Duration(seconds: 20)); // past the original 25s mark
+      expect(errorCalls, 1, reason: 'first timer must have been cancelled');
+    });
+  });
+
+  test('watchdog with null onError fires without throwing', () {
+    fakeAsync((async) {
+      final controller = makeController();
+      // onError deliberately left unset — the timer must not throw; it falls
+      // back to a debugPrint. A thrown error would fail the fakeAsync zone.
+      controller.startPreview(scanTimeout: const Duration(seconds: 25));
+      async.elapse(const Duration(seconds: 26));
+    });
+  });
 }

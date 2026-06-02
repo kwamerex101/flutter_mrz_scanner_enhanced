@@ -343,8 +343,8 @@ extension MRZScannerView: AVCaptureVideoDataOutputSampleBufferDelegate {
                 if !self.frameErrorLatched &&
                     self.consecutiveFrameErrors >= self.maxConsecutiveFrameErrors {
                     self.frameErrorLatched = true
-                    DispatchQueue.main.async {
-                        self.delegate?.onError("Frame processing failed repeatedly: \(error.localizedDescription)")
+                    DispatchQueue.main.async { [weak self] in
+                        self?.delegate?.onError("Frame processing failed repeatedly: \(error.localizedDescription)")
                     }
                 }
                 return

@@ -1,3 +1,22 @@
+# 3.2.0
+
+- 🛟 Surface scan failures instead of hanging on "Scanning…" forever:
+  - 🤖 Android: a systematic per-frame preprocessing failure now fires `onError`
+    once (after ~30 consecutive failures) via a thread-safe
+    `PreprocessingFailureLatch`, instead of silently dropping every frame.
+    Re-armed on the `start` call so a retry can't stay latched. OCR-stage
+    exceptions in the worker coroutine are now caught and logged.
+  - 🍏 iOS: mirrors the consecutive-failure counter on the Vision
+    text-detection path → one-shot `onError`.
+  - 🎯 Dart: `MRZController.startPreview` gains a `scanTimeout` watchdog
+    (default **25s**) that fires `onError` once and stops the preview if no MRZ
+    is read — covers the "OCR runs but never finds an MRZ" hang on both
+    platforms. New `MRZController.dispose()` cancels it.
+  - ⚠️ Behaviour change: the watchdog is ON BY DEFAULT, so a caller that
+    previously scanned indefinitely now times out at 25s. Pass
+    `scanTimeout: Duration.zero` to restore the old behaviour. `onError` must be
+    set for the timeout/native errors to reach the UI.
+
 # 3.1.4
 
 - 🧭 Android photo orientation fix:

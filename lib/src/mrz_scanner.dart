@@ -22,7 +22,12 @@ List<String> _splitRecognized(String recognizedText) {
   return mrzString.split('\n').where((s) => s.isNotEmpty).toList();
 }
 
-/// MRZ scanner camera widget
+/// MRZ scanner camera widget.
+///
+/// The [MRZController] handed to [onControllerCreated] owns a watchdog timer
+/// (see [MRZController.startPreview]). Retain the controller and call
+/// [MRZController.dispose] from your host `State.dispose()` so a pending
+/// timer cannot fire after the widget is unmounted.
 class MRZScanner extends StatelessWidget {
   const MRZScanner({
     required this.onControllerCreated,
@@ -110,9 +115,21 @@ class MRZController {
     }
     _watchdog = Timer(timeout, () {
       _watchdog = null;
-      onError?.call(
-        'No MRZ detected within ${timeout.inSeconds}s. Scan timed out.',
-      );
+      // Stop the native preview first: a timed-out scan should not keep the
+      // camera running, and it prevents a late native onError from firing a
+      // SECOND onError into a consumer that already reacted to the timeout.
+      _channel.invokeMethod<void>('stop');
+      const messagePrefix = 'No MRZ detected';
+      final message =
+          '$messagePrefix within ${timeout.inSeconds}s. Scan timed out.';
+      final cb = onError;
+      if (cb != null) {
+        cb(message);
+      } else {
+        // The whole escalation chain is severed if the consumer never set
+        // onError. Surface it in debug builds so the footgun is visible.
+        debugPrint('MRZController watchdog fired but onError is unset: $message');
+      }
     });
   }
 
@@ -178,9 +195,17 @@ class MRZController {
   /// Starts the live camera preview.
   ///
   /// [scanTimeout] arms a watchdog (see [_watchdog]); if no MRZ is read within
-  /// it, [onError] fires once. Defaults to 25s — long enough for slow scans
-  /// (poor light, cold OCR start, repositioning), short enough to unblock a
-  /// stuck user. Pass [Duration.zero] to disable the watchdog entirely.
+  /// it, [onError] fires once and the native preview is stopped. Defaults to
+  /// 25s — long enough for slow scans (poor light, cold OCR start,
+  /// repositioning), short enough to unblock a stuck user.
+  ///
+  /// Behaviour note: the watchdog is ON BY DEFAULT, so an existing caller that
+  /// previously scanned indefinitely will now time out at 25s. Pass
+  /// [Duration.zero] to restore the no-timeout behaviour.
+  ///
+  /// [onError] must be set before calling this for the timeout (and native
+  /// errors) to reach the UI; if it is null the timeout fires and is dropped
+  /// (logged via debugPrint in debug builds only).
   void startPreview({
     bool isFrontCam = false,
     Duration scanTimeout = const Duration(seconds: 25),

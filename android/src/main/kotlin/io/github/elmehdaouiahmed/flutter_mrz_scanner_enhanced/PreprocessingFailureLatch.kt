@@ -15,8 +15,14 @@ import java.util.concurrent.atomic.AtomicInteger
  *
  * Thread-safety: [recordFailure]/[recordSuccess] run on the Fotoapparat
  * frame-callback thread; [reset] runs on the platform thread (user retry via
- * the "start" method call). All state is atomic, so there is no torn read or
- * lost reset across those threads.
+ * the "start" method call). Both fields are atomic, and [fired] (set via
+ * [java.util.concurrent.atomic.AtomicBoolean.compareAndSet]) is the single
+ * source of truth, so the callback fires AT MOST ONCE. The two fields are not
+ * reset as one atomic unit, so a [reset] racing a frame-thread call that has
+ * already passed the threshold may, in the worst case, fire once on the very
+ * first frame of a retry — benign (a spurious error callback, never a missed
+ * fire and never a hang). [reset] clears the counter before [fired] to keep
+ * that window minimal.
  *
  * Pure (no Android dependencies) so it is unit-testable on a plain JVM.
  */

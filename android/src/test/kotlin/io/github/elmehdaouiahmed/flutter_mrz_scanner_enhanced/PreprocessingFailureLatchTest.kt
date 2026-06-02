@@ -64,6 +64,18 @@ class PreprocessingFailureLatchTest {
         assertTrue(latch.recordFailure())
     }
 
+    @Test
+    fun `recordSuccess after firing does not re-arm the latch`() {
+        val latch = PreprocessingFailureLatch(threshold = 2)
+        latch.recordFailure()
+        assertTrue(latch.recordFailure()) // fire
+        latch.recordSuccess()             // must clear the run, NOT un-fire
+        assertTrue(latch.hasFired)
+        // Still latched: further failures never re-fire without reset().
+        assertFalse(latch.recordFailure())
+        assertFalse(latch.recordFailure())
+    }
+
     @Test(expected = IllegalArgumentException::class)
     fun `rejects non-positive threshold`() {
         PreprocessingFailureLatch(threshold = 0)
@@ -89,8 +101,11 @@ class PreprocessingFailureLatchTest {
             }
         }
         start.countDown()
-        done.await(5, TimeUnit.SECONDS)
+        // Fail loudly if a worker stalled rather than silently passing on a
+        // partial fireCount.
+        assertTrue("workers did not finish in time", done.await(5, TimeUnit.SECONDS))
         pool.shutdown()
+        assertTrue("pool did not terminate", pool.awaitTermination(5, TimeUnit.SECONDS))
         // Across all threads, recordFailure() must return true exactly once.
         assertEquals(1, fireCount.get())
         assertTrue(latch.hasFired)
