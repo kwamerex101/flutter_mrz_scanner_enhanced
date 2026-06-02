@@ -22,6 +22,14 @@ public class MRZScannerView: UIView {
     // frames are dropped at captureOutput entry — preview queue stays free.
     private let ocrSemaphore = DispatchSemaphore(value: 1)
     private let ocrQueue = DispatchQueue(label: "mrz_ocr_queue", qos: .userInitiated)
+    // Parity with Android: surface a one-shot onError if the per-frame Vision
+    // text-detection pass throws on a sustained run of frames, instead of
+    // silently returning forever (which leaves the UI hung on "Scanning…").
+    // Mutated only on the serial `ocrQueue` (and re-armed on startScanning,
+    // dispatched onto the same queue), so no locking is required.
+    private var consecutiveFrameErrors = 0
+    private var frameErrorLatched = false
+    private let maxConsecutiveFrameErrors = 30
     // Reused across frames; safe because the upstream serial frame queue
     // (video_frames_queue) and this serial ocrQueue together guarantee
     // non-concurrent perform() calls on this VNRequest. The static path
@@ -97,6 +105,13 @@ public class MRZScannerView: UIView {
     // MARK: Scanning
     public func startScanning(_ isFrontCam: Bool) {
         self.isFrontCam = isFrontCam
+        // Re-arm the persistent-failure detector for this scan session (retry
+        // reuses the same view instance). Dispatched on ocrQueue so it
+        // serialises with frame processing and needs no lock.
+        ocrQueue.async { [weak self] in
+            self?.consecutiveFrameErrors = 0
+            self?.frameErrorLatched = false
+        }
         if captureSession.inputs.isEmpty {
             self.initialize()
         }
@@ -320,8 +335,22 @@ extension MRZScannerView: AVCaptureVideoDataOutputSampleBufferDelegate {
             do {
                 try imageRequestHandler.perform([self.textDetectionRequest])
             } catch {
+                // Systematic Vision failure (broken on this device/session)
+                // would otherwise hang the UI silently. Count consecutive
+                // throws and surface onError exactly once. error.localizedDescription
+                // is a Vision/system message — carries no document content.
+                self.consecutiveFrameErrors += 1
+                if !self.frameErrorLatched &&
+                    self.consecutiveFrameErrors >= self.maxConsecutiveFrameErrors {
+                    self.frameErrorLatched = true
+                    DispatchQueue.main.async { [weak self] in
+                        self?.delegate?.onError("Frame processing failed repeatedly: \(error.localizedDescription)")
+                    }
+                }
                 return
             }
+            // Vision pass succeeded — clear the consecutive-failure run.
+            self.consecutiveFrameErrors = 0
             guard let results = self.textDetectionRequest.results as? [VNTextObservation] else { return }
 
             let imageWidth = CGFloat(documentImage.width)

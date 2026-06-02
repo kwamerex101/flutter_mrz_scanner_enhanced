@@ -22,7 +22,12 @@ List<String> _splitRecognized(String recognizedText) {
   return mrzString.split('\n').where((s) => s.isNotEmpty).toList();
 }
 
-/// MRZ scanner camera widget
+/// MRZ scanner camera widget.
+///
+/// The [MRZController] handed to [onControllerCreated] owns a watchdog timer
+/// (see [MRZController.startPreview]). Retain the controller and call
+/// [MRZController.dispose] from your host `State.dispose()` so a pending
+/// timer cannot fire after the widget is unmounted.
 class MRZScanner extends StatelessWidget {
   const MRZScanner({
     required this.onControllerCreated,
@@ -94,6 +99,45 @@ class MRZController {
   void Function(String text)? onError;
   void Function()? onParsingFailed;
 
+  /// Watchdog for the "scanning but never finds an MRZ" hang: if neither a
+  /// successful parse ([onParsed]) nor a native [onError] arrives within the
+  /// timeout passed to [startPreview], [onError] is fired once so the UI can
+  /// surface a retry/fallback instead of sitting on "Scanning…" forever.
+  /// Note: [onParsingFailed] fires on every non-MRZ frame and deliberately
+  /// does NOT reset this timer — the watchdog measures wall-clock time, not
+  /// per-frame parse attempts.
+  Timer? _watchdog;
+
+  void _startWatchdog(Duration timeout) {
+    _watchdog?.cancel();
+    if (timeout <= Duration.zero) {
+      return; // opt-out: no watchdog
+    }
+    _watchdog = Timer(timeout, () {
+      _watchdog = null;
+      // Stop the native preview first: a timed-out scan should not keep the
+      // camera running, and it prevents a late native onError from firing a
+      // SECOND onError into a consumer that already reacted to the timeout.
+      _channel.invokeMethod<void>('stop');
+      const messagePrefix = 'No MRZ detected';
+      final message =
+          '$messagePrefix within ${timeout.inSeconds}s. Scan timed out.';
+      final cb = onError;
+      if (cb != null) {
+        cb(message);
+      } else {
+        // The whole escalation chain is severed if the consumer never set
+        // onError. Surface it in debug builds so the footgun is visible.
+        debugPrint('MRZController watchdog fired but onError is unset: $message');
+      }
+    });
+  }
+
+  void _cancelWatchdog() {
+    _watchdog?.cancel();
+    _watchdog = null;
+  }
+
   void flashlightOn() {
     _channel.invokeMethod<void>('flashlightOn');
   }
@@ -115,6 +159,7 @@ class MRZController {
   Future<void> _platformCallHandler(MethodCall call) {
     switch (call.method) {
       case 'onError':
+        _cancelWatchdog();
         onError?.call(call.arguments);
         debugPrint('Error occurred: ${call.arguments}');
         break;
@@ -128,6 +173,9 @@ class MRZController {
           if (lines.isNotEmpty) {
             final result = MRZParser.tryParse(lines);
             if (result != null) {
+              // Terminal success — stop the no-result watchdog before
+              // handing the result to the consumer.
+              _cancelWatchdog();
               onParsed!(MRZFullResult(mrz: filePath, mrzResult: result));
               debugPrint('Parsing successful');
             } else {
@@ -144,10 +192,38 @@ class MRZController {
     return Future.value();
   }
 
-  void startPreview({bool isFrontCam = false}) =>
-      _channel.invokeMethod<void>('start', {'isFrontCam': isFrontCam});
+  /// Starts the live camera preview.
+  ///
+  /// [scanTimeout] arms a watchdog (see [_watchdog]); if no MRZ is read within
+  /// it, [onError] fires once and the native preview is stopped. Defaults to
+  /// 25s — long enough for slow scans (poor light, cold OCR start,
+  /// repositioning), short enough to unblock a stuck user.
+  ///
+  /// Behaviour note: the watchdog is ON BY DEFAULT, so an existing caller that
+  /// previously scanned indefinitely will now time out at 25s. Pass
+  /// [Duration.zero] to restore the no-timeout behaviour.
+  ///
+  /// [onError] must be set before calling this for the timeout (and native
+  /// errors) to reach the UI; if it is null the timeout fires and is dropped
+  /// (logged via debugPrint in debug builds only).
+  void startPreview({
+    bool isFrontCam = false,
+    Duration scanTimeout = const Duration(seconds: 25),
+  }) {
+    _channel.invokeMethod<void>('start', {'isFrontCam': isFrontCam});
+    _startWatchdog(scanTimeout);
+  }
 
-  void stopPreview() => _channel.invokeMethod<void>('stop');
+  void stopPreview() {
+    _cancelWatchdog();
+    _channel.invokeMethod<void>('stop');
+  }
+
+  /// Releases the watchdog timer. Call from the host widget's `dispose()` so a
+  /// pending timer cannot fire [onError] after the consumer is gone.
+  void dispose() {
+    _cancelWatchdog();
+  }
 }
 
 class MRZFullResult {

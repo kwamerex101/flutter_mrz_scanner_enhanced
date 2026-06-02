@@ -40,6 +40,7 @@ android {
 
     sourceSets {
         main.java.srcDirs += 'src/main/kotlin'
+        test.java.srcDirs += 'src/test/kotlin'
     }
 
     defaultConfig {
@@ -63,4 +64,7 @@ dependencies {
     // ML Kit on-device text recognition (Latin model, bundled). Used by the
     // static MRZScanner.scanImage path. The live camera path keeps Tesseract.
     implementation 'com.google.mlkit:text-recognition:16.0.1'
+    // Host-side unit tests for pure logic (PreprocessingFailureLatch). No
+    // Android framework or device needed — runs under `./gradlew test`.
+    testImplementation 'junit:junit:4.13.2'
 }

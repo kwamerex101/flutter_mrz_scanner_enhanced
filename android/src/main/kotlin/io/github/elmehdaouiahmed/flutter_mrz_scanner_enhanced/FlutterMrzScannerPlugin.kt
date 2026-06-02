@@ -105,6 +105,10 @@ class MRZScannerView internal constructor(context: Context, messenger: BinaryMes
     override fun onMethodCall(@NonNull call: MethodCall, @NonNull result: MethodChannel.Result) {
         when (call.method) {
             "start" -> {
+                // Re-arm the persistent-failure detector: a retry reuses this
+                // same FotoapparatCamera instance, so without this a latched
+                // error state would make the retry silently hang again.
+                cameraView.resetErrorState()
                 val isFrontCam = call.argument<Boolean>("isFrontCam")
                 if (isFrontCam!!) {
                     cameraView.fotoapparat.switchTo(front(), cameraView.configuration)
