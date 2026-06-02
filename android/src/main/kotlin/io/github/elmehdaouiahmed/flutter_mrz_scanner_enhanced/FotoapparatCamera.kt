@@ -200,8 +200,19 @@ class FotoapparatCamera constructor(
             }
             cropped
         } catch (t: Throwable) {
+            // A single bad frame (unexpected buffer size/stride, transient
+            // decode/crop failure) must never crash the host app. Drop this
+            // frame and wait for the next one instead of rethrowing onto the
+            // Fotoapparat frame-callback thread, where an uncaught exception
+            // means process death. The rotation index math is correct, but
+            // calculateCutoutRectCardSize can still reject a degenerate crop.
+            Log.w(
+                "FotoapparatCamera",
+                "Dropping frame after preprocessing error: ${t.message}",
+                t
+            )
             ocrInFlight.set(false)
-            throw t
+            return
         }
         scope.launch {
             try {
